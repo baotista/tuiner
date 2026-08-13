@@ -1,0 +1,13 @@
+[package]
+name = "detector-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# PROTOTYPE — throwaway. See README.md. Not part of the real crate.
+
+[dependencies]
+cpal = "0.18"
+realfft = "3.5"
+rtrb = "0.3"
+hound = "3.5"
