@@ -141,6 +141,19 @@ the noise floor adaptively is a design decision, not something the prototype set
 p50 = 42 against 42. And it does not decay — the guitar holds k = 42 in both the −30..−40 dB band and
 below −40 dB. `k` is never limited by the signal, on real audio, through full decay. Confirms §2 and §3.
 
+### No octave errors on bass low E
+
+The bass clip alternates E1 and E2 roughly every second (the player's doing, not the detector's). That
+makes it unintentionally good material, because the E1↔E2 boundary is exactly where an octave-error-prone
+detector fails. All ten transitions came through as clean runs of 40–74 frames with no flapping:
+
+```
+_39 ^74 _45 ^52 _61 ^57 _55 ^42 _69 ^13     ( _ = E1, ^ = E2, one char per frame )
+```
+
+MPM's "first peak within 90% of the tallest" rule is doing its job. Picking the tallest peak outright
+is what produces octave errors, and this is the evidence that the distinction matters in practice.
+
 ## 7. Still open
 
 - **The hum clip is unusable.** `hum.wav` is digital silence: 99.85% of samples are exactly zero, peak
