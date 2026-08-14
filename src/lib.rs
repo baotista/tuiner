@@ -6,6 +6,7 @@ pub mod pipeline;
 pub mod pitch;
 pub mod smoothing;
 pub mod strobe;
+pub mod trail;
 pub mod ui;
 
 /// Analysis window, sized in milliseconds rather than samples so 44.1 kHz and 48 kHz devices
@@ -33,4 +34,13 @@ pub fn window_samples(sample_rate: u32) -> usize {
 /// Converts [`HOP_MS`] to a sample count at the given device sample rate.
 pub fn hop_samples(sample_rate: u32) -> usize {
     (sample_rate as f32 * HOP_MS / 1000.0).round() as usize
+}
+
+/// How much history the Deviation Trail keeps (issue #7): "roughly the last 10 seconds."
+pub const TRAIL_SECONDS: f32 = 10.0;
+
+/// Converts [`TRAIL_SECONDS`] to a hop count, since the Trail gains one sample per completed hop
+/// regardless of the device's sample rate.
+pub fn trail_capacity() -> usize {
+    (TRAIL_SECONDS * 1000.0 / HOP_MS).round() as usize
 }

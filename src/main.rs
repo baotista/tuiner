@@ -30,8 +30,9 @@ use tuiner::audio::{AudioSource, EnumeratedDevice, LevelMeter, LiveCapture, list
 use tuiner::picker::{DeviceEntry, Outcome, Picker, Selection, Step};
 use tuiner::pipeline::{Frame, Pipeline, Polled};
 use tuiner::strobe::Strobe;
+use tuiner::trail::{Trail, TrailSample};
 use tuiner::ui::{self, PickerView, Readout};
-use tuiner::{pitch, window_samples};
+use tuiner::{pitch, trail_capacity, window_samples};
 
 fn main() {
     let startup_devices = list_input_devices();
@@ -273,6 +274,7 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     // the string keeps sounding) distinguishable from the player simply not playing for a while
     // (which must not read as a stall once they start again).
     let mut last_pitched: Option<Instant> = None;
+    let mut trail = Trail::new(trail_capacity());
 
     let mut readout = Readout::Listening;
     loop {
@@ -297,6 +299,7 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                 readout = match note_reading(frame) {
                     Some((note, hz, cents, dimmed)) => {
                         if live {
+                            trail.push(TrailSample::Deviation(cents));
                             let target = pitch::target_hz(hz, cents);
                             let now = Instant::now();
                             if let Some(prev) = last_pitched {
@@ -304,6 +307,9 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                             }
                             last_pitched = Some(now);
                         } else {
+                            // Silent-held: still a gap for the Trail — it reflects the hop's
+                            // real classification, not what the readout happens to display.
+                            trail.push(TrailSample::Gap);
                             last_pitched = None;
                         }
                         Readout::Reading {
@@ -312,9 +318,11 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                             cents,
                             dimmed,
                             strobe_phase: strobe.phase(),
+                            trail: trail.padded_samples(),
                         }
                     }
                     None => {
+                        trail.push(TrailSample::Gap);
                         last_pitched = None;
                         Readout::Listening
                     }

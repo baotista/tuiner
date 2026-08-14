@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::picker::{DeviceEntry, Step};
 use crate::pitch::IN_TUNE_TOLERANCE_CENTS;
+use crate::trail::TrailSample;
 
 /// How far the coarse bar reaches in either direction. The Strobe, not this bar, carries fine
 /// precision past this range (ADR 0002) — this is only the coarse half.
@@ -26,6 +27,10 @@ const BAR_RANGE_CENTS: f32 = 50.0;
 /// exactly one shift of this many columns, so the pattern returns to how it looked at the start
 /// of the cycle.
 const STROBE_PERIOD: usize = 6;
+
+/// How far the Deviation Trail's vertical axis reaches in either direction — the same coarse
+/// range as the bar, so the two panels read on one consistent scale.
+const TRAIL_RANGE_CENTS: f32 = BAR_RANGE_CENTS;
 
 const COLOR_FLAT: Color = Color::Rgb(90, 150, 230);
 const COLOR_SHARP: Color = Color::Rgb(230, 145, 60);
@@ -45,6 +50,9 @@ pub enum Readout {
         /// The Strobe's current phase accumulator reading, in radians — frozen at whatever it
         /// last was while `dimmed`, since nothing is sounding to advance it against.
         strobe_phase: f32,
+        /// The Deviation Trail's recent history, oldest first. A snapshot, not a live handle —
+        /// this view-model stays independent of `trail::Trail`'s own bookkeeping.
+        trail: Vec<TrailSample>,
     },
 }
 
@@ -65,6 +73,7 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout) {
             cents,
             dimmed,
             strobe_phase,
+            trail,
         } => {
             let (color, direction) = deviation_style(*cents);
             let mut style = Style::default().fg(color);
@@ -81,7 +90,13 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout) {
 
             let bar = bar_line(*cents, inner.width as usize, style);
             let strobe = strobe_line(*strobe_phase, inner.width as usize, style);
-            frame.render_widget(Paragraph::new(vec![header, bar, strobe]), inner);
+
+            let mut lines = vec![header, bar, strobe];
+            let trail_rows = (inner.height as usize).saturating_sub(lines.len());
+            if trail_rows > 0 {
+                lines.extend(trail_canvas(trail, inner.width as usize, trail_rows, style));
+            }
+            frame.render_widget(Paragraph::new(lines), inner);
         }
     }
 }
@@ -147,6 +162,166 @@ fn strobe_line(phase: f32, width: usize, style: Style) -> Line<'static> {
         })
         .collect();
     Line::from(Span::styled(s, style))
+}
+
+/// Downsamples `samples` (chronological, oldest first) into exactly `bins` buckets, one per dot
+/// column the Deviation Trail will render. A bucket with at least one measured Deviation reads
+/// as their average; a bucket that is entirely gaps (or empty, before the Trail has filled up
+/// this far) reads as `None` — a hole in the canvas, never invented by interpolating neighbours.
+fn bin_samples(samples: &[TrailSample], bins: usize) -> Vec<Option<f32>> {
+    if bins == 0 || samples.is_empty() {
+        return vec![None; bins];
+    }
+    (0..bins)
+        .map(|i| {
+            let start = i * samples.len() / bins;
+            let end = ((i + 1) * samples.len() / bins).max(start + 1);
+            let values: Vec<f32> = samples[start..end]
+                .iter()
+                .filter_map(|s| match s {
+                    TrailSample::Deviation(cents) => Some(*cents),
+                    TrailSample::Gap => None,
+                })
+                .collect();
+            if values.is_empty() {
+                None
+            } else {
+                Some(values.iter().sum::<f32>() / values.len() as f32)
+            }
+        })
+        .collect()
+}
+
+/// Row/column bit within a braille cell for dot `(dx, dy)`, `dx` in `0..2`, `dy` in `0..4` — the
+/// standard Unicode braille dot numbering (dots 1-2-3-7 in the left column, 4-5-6-8 in the right).
+const BRAILLE_BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+
+/// A grid of braille cells addressed by dot coordinates — 2 dots wide and 4 tall per cell, the 8
+/// subpixels ADR 0002 spends colour down to one per cell to get. Exists so the Deviation Trail
+/// can be built up dot by dot and line by line, then flattened into `Line`s in one place.
+struct BrailleGrid {
+    cols: usize,
+    rows: usize,
+    cells: Vec<u8>,
+}
+
+impl BrailleGrid {
+    fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            cols,
+            rows,
+            cells: vec![0; cols * rows],
+        }
+    }
+
+    fn width_dots(&self) -> usize {
+        self.cols * 2
+    }
+
+    fn height_dots(&self) -> usize {
+        self.rows * 4
+    }
+
+    fn set_dot(&mut self, x: isize, y: isize) {
+        if x < 0 || y < 0 {
+            return;
+        }
+        let (x, y) = (x as usize, y as usize);
+        if x >= self.width_dots() || y >= self.height_dots() {
+            return;
+        }
+        let (cell_x, cell_y) = (x / 2, y / 4);
+        let (dx, dy) = (x % 2, y % 4);
+        self.cells[cell_y * self.cols + cell_x] |= BRAILLE_BITS[dy][dx];
+    }
+
+    /// Bresenham's line algorithm between two dot coordinates — the standard integer-only
+    /// midpoint variant, so a connected stretch of Deviation renders as a continuous trace
+    /// rather than only the dots that happen to land exactly on the line.
+    fn line(&mut self, (x0, y0): (isize, isize), (x1, y1): (isize, isize)) {
+        let dx = (x1 - x0).abs();
+        let sx: isize = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy: isize = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        loop {
+            self.set_dot(x, y);
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    fn to_lines(&self, style: Style) -> Vec<Line<'static>> {
+        (0..self.rows)
+            .map(|r| {
+                let s: String = (0..self.cols)
+                    .map(|c| {
+                        let bits = self.cells[r * self.cols + c];
+                        char::from_u32(0x2800 + bits as u32).unwrap_or(' ')
+                    })
+                    .collect();
+                Line::from(Span::styled(s, style))
+            })
+            .collect()
+    }
+}
+
+/// Maps a Deviation in cents to a dot row — clamped to [`TRAIL_RANGE_CENTS`], sharp at the top,
+/// flat at the bottom, matching the sign convention used everywhere else in the readout.
+fn cents_to_row(cents: f32, height_dots: usize) -> isize {
+    if height_dots == 0 {
+        return 0;
+    }
+    let ratio = (cents.clamp(-TRAIL_RANGE_CENTS, TRAIL_RANGE_CENTS) + TRAIL_RANGE_CENTS)
+        / (2.0 * TRAIL_RANGE_CENTS);
+    let inverted = 1.0 - ratio; // sharp (positive cents) renders near the top
+    (inverted * (height_dots - 1) as f32).round() as isize
+}
+
+/// Renders the Deviation Trail on a braille canvas `width_cells` × `height_cells`. Each dot
+/// column is one bin of `samples`' history; consecutive measured bins are connected, an isolated
+/// measured bin still shows as a single dot, and a gap bin is left blank — never interpolated
+/// through, per issue #7.
+fn trail_canvas(
+    samples: &[TrailSample],
+    width_cells: usize,
+    height_cells: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let mut grid = BrailleGrid::new(width_cells, height_cells);
+    let width_dots = grid.width_dots();
+    let height_dots = grid.height_dots();
+    if width_dots == 0 || height_dots == 0 {
+        return grid.to_lines(style);
+    }
+
+    let bins = bin_samples(samples, width_dots);
+    let mut prev: Option<(isize, isize)> = None;
+    for (x, value) in bins.into_iter().enumerate() {
+        match value {
+            Some(cents) => {
+                let point = (x as isize, cents_to_row(cents, height_dots));
+                grid.set_dot(point.0, point.1);
+                if let Some(from) = prev {
+                    grid.line(from, point);
+                }
+                prev = Some(point);
+            }
+            None => prev = None,
+        }
+    }
+    grid.to_lines(style)
 }
 
 /// What the Input Device / Input Channel picker should show, independent of `cpal` and the
@@ -281,6 +456,7 @@ mod tests {
             cents,
             dimmed: false,
             strobe_phase: 0.0,
+            trail: Vec::new(),
         }
     }
 
@@ -490,6 +666,7 @@ mod tests {
             cents: -0.5,
             dimmed: false,
             strobe_phase,
+            trail: Vec::new(),
         }
     }
 
@@ -541,5 +718,125 @@ mod tests {
             content_lines.len() >= 3,
             "expected header, bar and strobe lines, got:\n{text}"
         );
+    }
+
+    #[test]
+    fn bin_samples_averages_the_values_within_a_bucket() {
+        let samples = [TrailSample::Deviation(2.0), TrailSample::Deviation(4.0)];
+        assert_eq!(bin_samples(&samples, 1), vec![Some(3.0)]);
+    }
+
+    #[test]
+    fn bin_samples_marks_an_all_gap_bucket_as_none() {
+        let samples = [TrailSample::Gap, TrailSample::Gap];
+        assert_eq!(bin_samples(&samples, 1), vec![None]);
+    }
+
+    #[test]
+    fn bin_samples_ignores_gaps_mixed_in_with_real_values() {
+        let samples = [TrailSample::Gap, TrailSample::Deviation(10.0)];
+        assert_eq!(bin_samples(&samples, 1), vec![Some(10.0)]);
+    }
+
+    #[test]
+    fn bin_samples_with_no_samples_yields_all_none() {
+        assert_eq!(bin_samples(&[], 3), vec![None, None, None]);
+    }
+
+    #[test]
+    fn bin_samples_with_zero_bins_returns_empty() {
+        assert_eq!(
+            bin_samples(&[TrailSample::Deviation(1.0)], 0),
+            Vec::<Option<f32>>::new()
+        );
+    }
+
+    /// The blank braille pattern — no dots set — is what an unrendered or gap cell looks like.
+    fn blank_braille() -> char {
+        char::from_u32(0x2800).unwrap()
+    }
+
+    #[test]
+    fn a_single_dot_produces_the_correct_braille_character() {
+        let mut grid = BrailleGrid::new(1, 1);
+        grid.set_dot(0, 0); // dot 1: bit 0x01
+        let lines = grid.to_lines(Style::default());
+        assert_eq!(lines[0].spans[0].content, "⠁");
+    }
+
+    #[test]
+    fn a_dot_outside_the_grid_is_silently_ignored() {
+        let mut grid = BrailleGrid::new(1, 1);
+        grid.set_dot(-1, 0);
+        grid.set_dot(0, -1);
+        grid.set_dot(100, 100);
+        let lines = grid.to_lines(Style::default());
+        assert_eq!(lines[0].spans[0].content, blank_braille().to_string());
+    }
+
+    #[test]
+    fn a_horizontal_line_sets_every_dot_it_crosses() {
+        let mut grid = BrailleGrid::new(2, 1); // 4 dots wide, 4 dots tall
+        grid.line((0, 0), (3, 0));
+        let lines = grid.to_lines(Style::default());
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        // Every cell the line crosses must differ from the blank pattern.
+        assert!(text.chars().all(|c| c != blank_braille()));
+    }
+
+    #[test]
+    fn trail_of_all_gaps_renders_a_blank_canvas() {
+        let readout = Readout::Reading {
+            note: "G3".into(),
+            hz: 196.0,
+            cents: 0.0,
+            dimmed: false,
+            strobe_phase: 0.0,
+            trail: vec![TrailSample::Gap; 40],
+        };
+        let buf = render_to_buffer(&readout, 40, 8);
+        let text = buffer_text(&buf);
+        assert!(
+            !text
+                .chars()
+                .any(|c| (0x2801..=0x28FF).contains(&(c as u32))),
+            "expected no raised braille dots in an all-gap Trail, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn trail_with_values_renders_at_least_one_braille_dot() {
+        let readout = Readout::Reading {
+            note: "G3".into(),
+            hz: 196.0,
+            cents: 0.0,
+            dimmed: false,
+            strobe_phase: 0.0,
+            trail: vec![TrailSample::Deviation(-40.0); 40],
+        };
+        let buf = render_to_buffer(&readout, 40, 8);
+        let text = buffer_text(&buf);
+        assert!(
+            text.chars()
+                .any(|c| (0x2801..=0x28FF).contains(&(c as u32))),
+            "expected at least one raised braille dot with real Deviation history, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn trail_never_overflows_at_various_sizes() {
+        let readout = Readout::Reading {
+            note: "G3".into(),
+            hz: 196.0,
+            cents: 0.0,
+            dimmed: false,
+            strobe_phase: 0.0,
+            trail: vec![TrailSample::Deviation(12.0); 50],
+        };
+        for (width, height) in [(0u16, 0u16), (1, 1), (2, 2), (3, 6), (40, 3), (120, 20)] {
+            let buf = render_to_buffer(&readout, width, height);
+            assert_eq!(buf.area.width, width);
+            assert_eq!(buf.area.height, height);
+        }
     }
 }
