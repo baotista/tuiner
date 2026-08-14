@@ -111,3 +111,21 @@ nothing where there is no inharmonicity to correct.
 
 The benefit largely vanishes at B = 2e-4, but a uniform B across the whole range is unphysical: thick
 wound bass strings have low B and thin plain steel has high B, so that case is not a real instrument.
+
+### Correction, from building the real crate: the low-pass needs a floor
+
+"Strictly periodic signals are unchanged at 0.01¢" above is wrong at the bottom of the range. It held
+for the sweep as tested here, where only B0 sits below five periods per window — but a semitone-by-semitone
+probe from B0 to E2 (still strictly periodic, no inharmonicity) found the raised-cosine taper itself
+distorting the peak whenever the window holds only 3-4 periods (`k_max_window`), up to **1.29¢ at C#1
+and D1** and **1.69¢ at B0** — regressing the very ≤1¢ requirement the low-pass exists to protect,
+with nothing for it to correct at those points. From 5 periods on (E1 and above) the taper is safe and
+the stated benefit holds.
+
+Adopted fix: skip the low-pass when `k_max_window < 5`, falling back to the plain full-band NSDF for
+refinement at those few, very low notes. This gives up the inharmonicity correction exactly where ADR
+0001's own sweep (§ low-pass table) shows it would help real strings most — B0's inharmonic case improved
+most of any note, +3.12¢ → −0.69¢ — but that benefit was only ever measured with inharmonicity present,
+never in combination with this taper artifact, so there is no real-string evidence it survives the
+combination. Revisit if a narrower or gentler taper is found that keeps the benefit at low `k` without
+reintroducing the artifact.
