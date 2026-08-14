@@ -1,11 +1,15 @@
-//! The Chromatic Mode readout: nearest Note, sounding Pitch, Deviation, a coarse ±50 cent bar,
-//! and the Strobe. Written as a pure function of a small view-model (`Readout`), not of
-//! `pipeline::Frame` or `strobe::Strobe` directly, so it renders — and tests — without any audio
-//! plumbing.
+//! The tuning readout: nearest Note or matched String, sounding Pitch, Deviation, a coarse ±50
+//! cent bar, the Strobe, the Deviation Trail, and — in Guided Mode — the Headstock sprite and
+//! String panel. Written as a pure function of a small view-model (`Readout`), not of
+//! `pipeline::Frame`, `strobe::Strobe`, or `tuning::Tuning` directly, so it renders — and tests —
+//! without any audio plumbing.
 //!
 //! Palette is blue for flat, orange for sharp, bright neutral for in tune — deliberately not
 //! green and red, per ADR 0003. Hue carries direction only; magnitude comes from the bar
-//! marker's position and the Strobe's drift rate, readable with colour ignored entirely.
+//! marker's position and the Strobe's drift rate, readable with colour ignored entirely. The
+//! Headstock's Pegs carry the same rule further: each `StringStatus` is a distinct filled shape,
+//! not just a distinct colour, per ADR 0002's half-block/braille split (half-blocks here, since
+//! each Peg needs its own colour — braille spends colour down to one per cell).
 
 use std::f32::consts::TAU;
 
@@ -18,6 +22,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::picker::{DeviceEntry, Step};
 use crate::pitch::IN_TUNE_TOLERANCE_CENTS;
 use crate::trail::TrailSample;
+use crate::tuning::StringStatus;
 
 /// How far the coarse bar reaches in either direction. The Strobe, not this bar, carries fine
 /// precision past this range (ADR 0002) — this is only the coarse half.
@@ -36,13 +41,32 @@ const COLOR_FLAT: Color = Color::Rgb(90, 150, 230);
 const COLOR_SHARP: Color = Color::Rgb(230, 145, 60);
 const COLOR_IN_TUNE: Color = Color::Rgb(235, 235, 235);
 
+/// One String's row on the Headstock panel and its Peg on the sprite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringView {
+    pub number: u8,
+    pub note: String,
+    pub status: StringStatus,
+}
+
+/// The Headstock sprite and String panel's data, present only in Guided Mode — Chromatic Mode
+/// has no Tuning, and so no Strings to show. Carried on both `Readout` variants so progress stays
+/// visible whether or not a Pitch happens to be sounding this instant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeadstockView {
+    pub strings: Vec<StringView>,
+}
+
 /// What the readout should show, independent of how it got there (live, held, or nothing yet).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Readout {
     /// Nothing trustworthy is sounding. `locked` names an active String Lock (String number and
     /// Note) even here — a fresh string is exactly the case a Lock exists for, and it often
     /// won't produce a stable Pitch the moment the player engages it.
-    Listening { locked: Option<(u8, String)> },
+    Listening {
+        locked: Option<(u8, String)>,
+        headstock: Option<HeadstockView>,
+    },
     /// A Pitch reading — live if `dimmed` is false, held from before a Silent gap if true.
     Reading {
         note: String,
@@ -63,6 +87,7 @@ pub enum Readout {
         /// The Deviation Trail's recent history, oldest first. A snapshot, not a live handle —
         /// this view-model stays independent of `trail::Trail`'s own bookkeeping.
         trail: Vec<TrailSample>,
+        headstock: Option<HeadstockView>,
     },
 }
 
@@ -77,13 +102,17 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
     frame.render_widget(block, area);
 
     match readout {
-        Readout::Listening { locked } => {
+        Readout::Listening { locked, headstock } => {
             let mut lines = vec![Line::from("listening…")];
             if let Some((number, note)) = locked {
                 lines.push(Line::from(format!(
                     "[Locked: {}]",
                     string_label(*number, note)
                 )));
+            }
+            if let Some(view) = headstock {
+                let remaining = (inner.height as usize).saturating_sub(lines.len());
+                lines.extend(headstock_and_panel_lines(view).into_iter().take(remaining));
             }
             frame.render_widget(Paragraph::new(lines), inner);
         }
@@ -96,6 +125,7 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
             locked,
             strobe_phase,
             trail,
+            headstock,
         } => {
             let (color, direction) = deviation_style(*cents);
             let mut style = Style::default().fg(color);
@@ -119,9 +149,17 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
             let strobe = strobe_line(*strobe_phase, inner.width as usize, style);
 
             let mut lines = vec![header, bar, strobe];
-            let trail_rows = (inner.height as usize).saturating_sub(lines.len());
-            if trail_rows > 0 {
-                lines.extend(trail_canvas(trail, inner.width as usize, trail_rows, style));
+            let mut remaining = (inner.height as usize).saturating_sub(lines.len());
+
+            if let Some(view) = headstock {
+                let panel = headstock_and_panel_lines(view);
+                let take = panel.len().min(remaining);
+                lines.extend(panel.into_iter().take(take));
+                remaining -= take;
+            }
+
+            if remaining > 0 {
+                lines.extend(trail_canvas(trail, inner.width as usize, remaining, style));
             }
             frame.render_widget(Paragraph::new(lines), inner);
         }
@@ -132,6 +170,193 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
 /// naming an active String Lock while `Listening`, so the two states agree on one format.
 fn string_label(number: u8, note: &str) -> String {
     format!("Str {number} {note}")
+}
+
+const PEG_UNTOUCHED: Color = Color::Rgb(90, 90, 90);
+const PEG_SOUNDING: Color = Color::Rgb(230, 200, 80);
+const HEADSTOCK_WOOD: Color = Color::Rgb(120, 90, 60);
+
+/// Each Peg is a `PEG_SIZE` × `PEG_SIZE` nub, reused for all three `StringStatus` shapes.
+const PEG_SIZE: usize = 3;
+/// Vertical pixel distance between one Peg's top and the next — a six-in-line (or four-in-line)
+/// Headstock's defining feature, all Pegs mounted along one straight edge in String order.
+const PEG_SPACING: usize = 4;
+/// Blank pixel columns between the body's edge and the Pegs, so they read as sticking out of it
+/// rather than fused to its side.
+const PEG_GAP: usize = 1;
+const BODY_WIDTH: usize = 7;
+/// Body rows above the first Peg and below the last, so the row of Pegs doesn't run flush with
+/// either end of the body.
+const BODY_MARGIN: usize = 2;
+/// Rows over which the body linearly tapers down to the neck's width — the paddle silhouette a
+/// real Headstock has, rather than a plain rectangle.
+const TAPER_HEIGHT: usize = 4;
+const NECK_WIDTH: usize = 3;
+const NECK_HEIGHT: usize = 4;
+
+/// A pixel grid rendered two rows at a time via half-block characters (▀/▄), which keep two
+/// independently coloured subpixels per cell — the trick ADR 0002 reserves for the Headstock
+/// sprite, since braille spends colour down to one per cell instead. An unset pixel falls through
+/// to the terminal's own background rather than forcing a colour.
+struct PixelGrid {
+    width: usize,
+    height: usize,
+    pixels: Vec<Option<Color>>,
+}
+
+impl PixelGrid {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixels: vec![None; width * height],
+        }
+    }
+
+    fn set(&mut self, x: usize, y: usize, color: Color) {
+        if x < self.width && y < self.height {
+            self.pixels[y * self.width + x] = Some(color);
+        }
+    }
+
+    fn get(&self, x: usize, y: usize) -> Option<Color> {
+        if x < self.width && y < self.height {
+            self.pixels[y * self.width + x]
+        } else {
+            None
+        }
+    }
+
+    fn to_lines(&self) -> Vec<Line<'static>> {
+        (0..self.height)
+            .step_by(2)
+            .map(|y| {
+                let spans: Vec<Span<'static>> = (0..self.width)
+                    .map(|x| {
+                        let top = self.get(x, y);
+                        let bottom = self.get(x, y + 1);
+                        match (top, bottom) {
+                            (Some(t), Some(b)) => Span::styled("▀", Style::default().fg(t).bg(b)),
+                            (Some(t), None) => Span::styled("▀", Style::default().fg(t)),
+                            (None, Some(b)) => Span::styled("▄", Style::default().fg(b)),
+                            (None, None) => Span::raw(" "),
+                        }
+                    })
+                    .collect();
+                Line::from(spans)
+            })
+            .collect()
+    }
+}
+
+/// The Headstock sprite: a vertical paddle tapering into a neck stub, with one Peg per String
+/// mounted along its right edge in a straight line, top to bottom — the actual defining shape of
+/// a six-in-line or four-in-line Headstock (all tuners on one edge, in String order), rather than
+/// pegs sitting on top of a block. `strings.len()` alone decides how many Pegs there are, so one
+/// parametric shape covers both instruments instead of two hardcoded ones. Each Peg's fill shape,
+/// not just its colour, differs by `StringStatus` so state reads with colour ignored entirely: a
+/// small dot (`Untouched`), a solid block (`Sounding`), or a cross (`InTune`).
+fn headstock_sprite_lines(strings: &[StringView]) -> Vec<Line<'static>> {
+    let peg_count = strings.len();
+    let peg_run_height = peg_count.saturating_sub(1) * PEG_SPACING + PEG_SIZE;
+    let body_height = BODY_MARGIN * 2 + peg_run_height;
+    let height = body_height + TAPER_HEIGHT + NECK_HEIGHT;
+    let width = BODY_WIDTH + PEG_GAP + PEG_SIZE;
+    let mut grid = PixelGrid::new(width, height);
+
+    // The body: full `BODY_WIDTH` through the straight run the Pegs mount along, then tapering
+    // to the neck's width — the paddle silhouette a real Headstock has.
+    for y in 0..body_height {
+        for x in 0..BODY_WIDTH {
+            grid.set(x, y, HEADSTOCK_WOOD);
+        }
+    }
+    for row in 0..TAPER_HEIGHT {
+        let t = row as f32 / (TAPER_HEIGHT.saturating_sub(1).max(1)) as f32;
+        let row_width = (BODY_WIDTH as f32 - (BODY_WIDTH - NECK_WIDTH) as f32 * t).round() as usize;
+        for x in 0..row_width {
+            grid.set(x, body_height + row, HEADSTOCK_WOOD);
+        }
+    }
+    for y in (body_height + TAPER_HEIGHT)..height {
+        for x in 0..NECK_WIDTH {
+            grid.set(x, y, HEADSTOCK_WOOD);
+        }
+    }
+
+    // Pegs, sticking out from the body's right edge — one per String, evenly spaced top to
+    // bottom in String order, `PEG_GAP` blank columns clear of the body so they read as
+    // protruding from it rather than fused to its side.
+    let peg_x = BODY_WIDTH + PEG_GAP;
+    for (i, s) in strings.iter().enumerate() {
+        let top = BODY_MARGIN + i * PEG_SPACING;
+        match s.status {
+            StringStatus::Untouched => grid.set(peg_x + 1, top + 1, PEG_UNTOUCHED),
+            StringStatus::Sounding => {
+                for dy in 0..PEG_SIZE {
+                    for dx in 0..PEG_SIZE {
+                        grid.set(peg_x + dx, top + dy, PEG_SOUNDING);
+                    }
+                }
+            }
+            StringStatus::InTune => {
+                // A cross, not a solid block: half-block rendering only changes *character*
+                // (not just colour) where a whole cell's top-and-bottom pixel pattern differs
+                // from its neighbours, so leaving the corners unset — not just one hidden pixel
+                // in the middle of an otherwise-solid block — is what makes this distinguishable
+                // from `Sounding` with colour ignored entirely, not only by a colour difference.
+                for dy in 0..PEG_SIZE {
+                    for dx in 0..PEG_SIZE {
+                        if dx == 1 || dy == 1 {
+                            grid.set(peg_x + dx, top + dy, COLOR_IN_TUNE);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    grid.to_lines()
+}
+
+/// String number, Note, and status symbol — a distinct glyph per `StringStatus` (`·`/`●`/`✓`)
+/// on top of the colour, so the panel reads with colour ignored too.
+fn string_panel_lines(strings: &[StringView]) -> Vec<Line<'static>> {
+    strings
+        .iter()
+        .map(|s| {
+            let (color, symbol) = match s.status {
+                StringStatus::Untouched => (PEG_UNTOUCHED, '·'),
+                StringStatus::Sounding => (PEG_SOUNDING, '●'),
+                StringStatus::InTune => (COLOR_IN_TUNE, '✓'),
+            };
+            Line::from(Span::styled(
+                format!("{:>2} {:<4}{symbol}", s.number, s.note),
+                Style::default().fg(color),
+            ))
+        })
+        .collect()
+}
+
+/// The sprite and panel side by side, row for row — compact enough to share the same lines
+/// budget as the Trail beneath the coarse readout.
+fn headstock_and_panel_lines(view: &HeadstockView) -> Vec<Line<'static>> {
+    let sprite = headstock_sprite_lines(&view.strings);
+    let panel = string_panel_lines(&view.strings);
+    let rows = sprite.len().max(panel.len());
+    (0..rows)
+        .map(|i| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            if let Some(l) = sprite.get(i) {
+                spans.extend(l.spans.iter().cloned());
+            }
+            spans.push(Span::raw("   "));
+            if let Some(l) = panel.get(i) {
+                spans.extend(l.spans.iter().cloned());
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// (colour, direction word) for a Deviation. Never names a rotation — tightening always raises
@@ -494,6 +719,7 @@ mod tests {
             locked: false,
             strobe_phase: 0.0,
             trail: Vec::new(),
+            headstock: None,
         }
     }
 
@@ -594,7 +820,14 @@ mod tests {
 
     #[test]
     fn listening_state_names_no_note() {
-        let buf = render_to_buffer(&Readout::Listening { locked: None }, 60, 6);
+        let buf = render_to_buffer(
+            &Readout::Listening {
+                locked: None,
+                headstock: None,
+            },
+            60,
+            6,
+        );
         let text = buffer_text(&buf);
         assert!(text.contains("listening"));
     }
@@ -604,6 +837,7 @@ mod tests {
         let buf = render_to_buffer(
             &Readout::Listening {
                 locked: Some((5, "A2".into())),
+                headstock: None,
             },
             60,
             6,
@@ -719,6 +953,7 @@ mod tests {
             locked: false,
             strobe_phase,
             trail: Vec::new(),
+            headstock: None,
         }
     }
 
@@ -847,6 +1082,7 @@ mod tests {
             locked: false,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Gap; 40],
+            headstock: None,
         };
         let buf = render_to_buffer(&readout, 40, 8);
         let text = buffer_text(&buf);
@@ -869,6 +1105,7 @@ mod tests {
             locked: false,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Deviation(-40.0); 40],
+            headstock: None,
         };
         let buf = render_to_buffer(&readout, 40, 8);
         let text = buffer_text(&buf);
@@ -890,6 +1127,7 @@ mod tests {
             locked: false,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Deviation(12.0); 50],
+            headstock: None,
         };
         for (width, height) in [(0u16, 0u16), (1, 1), (2, 2), (3, 6), (40, 3), (120, 20)] {
             let buf = render_to_buffer(&readout, width, height);
@@ -909,6 +1147,7 @@ mod tests {
             locked: false,
             strobe_phase: 0.0,
             trail: Vec::new(),
+            headstock: None,
         };
         let text = buffer_text(&render_to_buffer(&readout, 60, 6));
         assert!(
@@ -938,5 +1177,175 @@ mod tests {
             text.contains("Guided — DADGAD"),
             "expected the Mode/Tuning label in the title, got:\n{text}"
         );
+    }
+
+    fn one_string(status: StringStatus) -> Vec<StringView> {
+        vec![StringView {
+            number: 1,
+            note: "E2".into(),
+            status,
+        }]
+    }
+
+    #[test]
+    fn headstock_sprite_has_the_right_number_of_pegs_for_guitar_and_bass() {
+        let guitar: Vec<StringView> = (1..=6)
+            .map(|n| StringView {
+                number: n,
+                note: "E2".into(),
+                status: StringStatus::Untouched,
+            })
+            .collect();
+        let bass: Vec<StringView> = (1..=4)
+            .map(|n| StringView {
+                number: n,
+                note: "E1".into(),
+                status: StringStatus::Untouched,
+            })
+            .collect();
+
+        // Both instruments share one Peg column at the body's right edge — six-in-line and
+        // four-in-line differ in how many Pegs run down it, i.e. the sprite's height, not width.
+        let expected_width = BODY_WIDTH + PEG_GAP + PEG_SIZE;
+        let guitar_lines = headstock_sprite_lines(&guitar);
+        let bass_lines = headstock_sprite_lines(&bass);
+        for line in &guitar_lines {
+            assert_eq!(line.width(), expected_width);
+        }
+        for line in &bass_lines {
+            assert_eq!(line.width(), expected_width);
+        }
+        assert!(
+            guitar_lines.len() > bass_lines.len(),
+            "six Pegs must run longer down the edge than four"
+        );
+    }
+
+    #[test]
+    fn headstock_peg_shapes_differ_by_status_with_colour_ignored() {
+        let render = |status| {
+            headstock_sprite_lines(&one_string(status))
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let untouched = render(StringStatus::Untouched);
+        let sounding = render(StringStatus::Sounding);
+        let in_tune = render(StringStatus::InTune);
+        assert_ne!(
+            untouched, sounding,
+            "Untouched and Sounding must render differently"
+        );
+        assert_ne!(
+            untouched, in_tune,
+            "Untouched and InTune must render differently"
+        );
+        assert_ne!(
+            sounding, in_tune,
+            "Sounding and InTune must render differently"
+        );
+    }
+
+    #[test]
+    fn string_panel_uses_a_distinct_symbol_per_status() {
+        let untouched = string_panel_lines(&one_string(StringStatus::Untouched))[0].clone();
+        let sounding = string_panel_lines(&one_string(StringStatus::Sounding))[0].clone();
+        let in_tune = string_panel_lines(&one_string(StringStatus::InTune))[0].clone();
+        let text_of = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(text_of(&untouched).contains('·'));
+        assert!(text_of(&sounding).contains('●'));
+        assert!(text_of(&in_tune).contains('✓'));
+    }
+
+    #[test]
+    fn string_panel_names_the_string_number_and_note() {
+        let line = &string_panel_lines(&one_string(StringStatus::Untouched))[0];
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('1'));
+        assert!(text.contains("E2"));
+    }
+
+    fn headstock_view(strings: Vec<StringView>) -> HeadstockView {
+        HeadstockView { strings }
+    }
+
+    #[test]
+    fn reading_with_a_headstock_renders_the_sprite_and_panel() {
+        let readout = Readout::Reading {
+            note: "A2".into(),
+            hz: 110.0,
+            cents: 0.0,
+            dimmed: false,
+            string_number: Some(1),
+            locked: false,
+            strobe_phase: 0.0,
+            trail: Vec::new(),
+            headstock: Some(headstock_view(vec![StringView {
+                number: 1,
+                note: "A2".into(),
+                status: StringStatus::InTune,
+            }])),
+        };
+        let text = buffer_text(&render_to_buffer(&readout, 60, 10));
+        assert!(
+            text.contains('✓'),
+            "expected the panel's status symbol in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn listening_with_a_headstock_still_renders_it() {
+        let readout = Readout::Listening {
+            locked: None,
+            headstock: Some(headstock_view(vec![StringView {
+                number: 3,
+                note: "G3".into(),
+                status: StringStatus::Sounding,
+            }])),
+        };
+        let text = buffer_text(&render_to_buffer(&readout, 60, 10));
+        assert!(
+            text.contains('●'),
+            "expected the panel's status symbol in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn headstock_never_overflows_at_various_sizes() {
+        let readout = Readout::Reading {
+            note: "A2".into(),
+            hz: 110.0,
+            cents: 0.0,
+            dimmed: false,
+            string_number: Some(1),
+            locked: false,
+            strobe_phase: 0.0,
+            trail: Vec::new(),
+            headstock: Some(headstock_view(
+                (1..=6)
+                    .map(|n| StringView {
+                        number: n,
+                        note: "E2".into(),
+                        status: StringStatus::Untouched,
+                    })
+                    .collect(),
+            )),
+        };
+        for (width, height) in [(0u16, 0u16), (1, 1), (10, 3), (40, 8), (120, 20)] {
+            let buf = render_to_buffer(&readout, width, height);
+            assert_eq!(buf.area.width, width);
+            assert_eq!(buf.area.height, height);
+        }
     }
 }

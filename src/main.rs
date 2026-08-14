@@ -20,6 +20,7 @@
 //! running, not an index into any particular enumeration, since indices shift as devices come and
 //! go.
 
+use std::collections::HashSet;
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,7 @@ use tuiner::picker::{DeviceEntry, Outcome, Picker, Selection, Step};
 use tuiner::pipeline::{Frame, Pipeline, Polled};
 use tuiner::strobe::Strobe;
 use tuiner::trail::{Trail, TrailSample};
-use tuiner::ui::{self, PickerView, Readout};
+use tuiner::ui::{self, HeadstockView, PickerView, Readout, StringView};
 use tuiner::{pitch, trail_capacity, tuning, window_samples};
 
 fn main() {
@@ -291,8 +292,18 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     // fresh string that starts far too flat to fall inside any Capture Range. Only meaningful in
     // Guided Mode; a Tuning change clears it, since the Target Pitch it referred to has changed.
     let mut string_lock: Option<u8> = None;
+    // String numbers whose live readings have ever landed within the In-Tune Tolerance, for the
+    // Headstock panel (issue #10). Sticky once a number is in the set, since this tracks session
+    // progress rather than the instantaneous reading — a Tuning change clears it, just like the
+    // Lock, since it would otherwise name Strings that no longer exist under the new Tuning. Keyed
+    // by String number rather than indexed by position, so nothing here assumes numbers are
+    // contiguous from 1 — that's `tuning::build()`'s invariant to keep, not this loop's to lean on.
+    let mut reached_in_tune: HashSet<u8> = HashSet::new();
 
-    let mut readout = Readout::Listening { locked: None };
+    let mut readout = Readout::Listening {
+        locked: None,
+        headstock: None,
+    };
     loop {
         if handle.disconnected() {
             return TuningExit::DeviceLost;
@@ -314,6 +325,7 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                 KeyCode::Char('t') => {
                     tuning_idx = (tuning_idx + 1) % tunings.len();
                     string_lock = None;
+                    reached_in_tune.clear();
                 }
                 KeyCode::Char(c @ '1'..='6') if mode == Mode::Guided => {
                     let n = c.to_digit(10).expect("guarded by '1'..='6'") as u8;
@@ -329,7 +341,14 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                 readout = match hz_reading(frame) {
                     Some((hz, dimmed)) => {
                         let named = name_pitch(mode, &tunings[tuning_idx], string_lock, hz);
+                        let mut sounding = None;
                         if live {
+                            sounding = named.string_number;
+                            if let Some(n) = named.string_number
+                                && named.cents.abs() <= pitch::IN_TUNE_TOLERANCE_CENTS
+                            {
+                                reached_in_tune.insert(n);
+                            }
                             trail.push(TrailSample::Deviation(named.cents));
                             let target = pitch::target_hz(hz, named.cents);
                             let now = Instant::now();
@@ -352,6 +371,12 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                             locked: named.locked,
                             strobe_phase: strobe.phase(),
                             trail: trail.padded_samples(),
+                            headstock: headstock_view(
+                                mode,
+                                &tunings[tuning_idx],
+                                &reached_in_tune,
+                                sounding,
+                            ),
                         }
                     }
                     None => {
@@ -359,6 +384,12 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                         last_pitched = None;
                         Readout::Listening {
                             locked: locked_target(mode, &tunings[tuning_idx], string_lock),
+                            headstock: headstock_view(
+                                mode,
+                                &tunings[tuning_idx],
+                                &reached_in_tune,
+                                None,
+                            ),
                         }
                     }
                 };
@@ -486,6 +517,41 @@ fn locked_target(
     active_lock(mode, tuning, string_lock).map(|s| (s.number, s.note.clone()))
 }
 
+/// The Headstock sprite and String panel's data (issue #10): `None` in Chromatic Mode, since
+/// there is no Tuning to show Strings for. `sounding` is the String matching the current live
+/// Pitch, if any — it renders as actively sounding only until `reached_in_tune` marks it done, at
+/// which point the achievement takes priority over the transient "currently playing" state.
+fn headstock_view(
+    mode: Mode,
+    tuning: &tuning::Tuning,
+    reached_in_tune: &HashSet<u8>,
+    sounding: Option<u8>,
+) -> Option<HeadstockView> {
+    if mode != Mode::Guided {
+        return None;
+    }
+    let strings = tuning
+        .strings
+        .iter()
+        .map(|s| {
+            let done = reached_in_tune.contains(&s.number);
+            let status = if done {
+                tuning::StringStatus::InTune
+            } else if sounding == Some(s.number) {
+                tuning::StringStatus::Sounding
+            } else {
+                tuning::StringStatus::Untouched
+            };
+            StringView {
+                number: s.number,
+                note: s.note.clone(),
+                status,
+            }
+        })
+        .collect();
+    Some(HeadstockView { strings })
+}
+
 /// The String Lock state after digit key `n` is pressed: locks onto String `n` if `tuning` has
 /// one, releases an existing Lock on that same String, or leaves the Lock untouched if `n` is
 /// beyond `tuning`'s String count.
@@ -569,6 +635,50 @@ mod tests {
     fn locked_target_is_none_when_nothing_is_locked() {
         let bass = bass_standard();
         assert_eq!(locked_target(Mode::Guided, &bass, None), None);
+    }
+
+    #[test]
+    fn headstock_view_is_none_in_chromatic_mode() {
+        let bass = bass_standard();
+        let reached = HashSet::new();
+        assert!(headstock_view(Mode::Chromatic, &bass, &reached, Some(1)).is_none());
+    }
+
+    #[test]
+    fn headstock_view_marks_the_currently_sounding_string() {
+        let bass = bass_standard();
+        let reached = HashSet::new();
+        let view = headstock_view(Mode::Guided, &bass, &reached, Some(2)).unwrap();
+        let s2 = view.strings.iter().find(|s| s.number == 2).unwrap();
+        assert_eq!(s2.status, tuning::StringStatus::Sounding);
+        let s1 = view.strings.iter().find(|s| s.number == 1).unwrap();
+        assert_eq!(s1.status, tuning::StringStatus::Untouched);
+    }
+
+    #[test]
+    fn headstock_view_prioritises_in_tune_over_currently_sounding() {
+        let bass = bass_standard();
+        let reached = HashSet::from([2]); // String 2 has reached In-Tune Tolerance at some point
+        let view = headstock_view(Mode::Guided, &bass, &reached, Some(2)).unwrap();
+        let s2 = view.strings.iter().find(|s| s.number == 2).unwrap();
+        assert_eq!(
+            s2.status,
+            tuning::StringStatus::InTune,
+            "InTune must stick even while this String is still the one sounding"
+        );
+    }
+
+    #[test]
+    fn headstock_view_keeps_in_tune_strings_marked_after_moving_on() {
+        let bass = bass_standard();
+        let reached = HashSet::from([4]); // String 4 reached tune earlier
+        let view = headstock_view(Mode::Guided, &bass, &reached, Some(1)).unwrap();
+        let s4 = view.strings.iter().find(|s| s.number == 4).unwrap();
+        assert_eq!(
+            s4.status,
+            tuning::StringStatus::InTune,
+            "progress must not be lost once the player moves on to another String"
+        );
     }
 
     #[test]

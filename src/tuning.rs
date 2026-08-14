@@ -6,6 +6,9 @@
 //! A single matching entry point ([`Tuning::match_pitch`]) hides the neighbour-distance
 //! derivation, the absolute cap, and the awkward cases (DADGAD's G3/A3 narrowing, the outermost
 //! String on every Tuning hitting the cap) behind one call.
+//!
+//! [`StringStatus`] is the small piece of session progress the Headstock panel (issue #10)
+//! renders per String — untouched, currently sounding, or already in tune.
 
 use crate::pitch;
 
@@ -34,6 +37,18 @@ pub struct InstrumentString {
 pub struct Tuning {
     pub name: &'static str,
     pub strings: Vec<InstrumentString>,
+}
+
+/// Where a String currently stands, for the Headstock panel (issue #10). `Untouched` until a
+/// live Pitch first matches it; `Sounding` while it is the currently-active match and not yet in
+/// tune; `InTune` once a matched reading has ever landed within the In-Tune Tolerance — and it
+/// stays `InTune` even after the player moves on to another String, so progress is never lost by
+/// glancing away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringStatus {
+    Untouched,
+    Sounding,
+    InTune,
 }
 
 /// What a sounding Pitch matched to, in Guided Mode.
