@@ -231,6 +231,11 @@ Note, Deviation and Strobe as the irreducible core, and refuse outright below ro
 `Tab` toggles Mode · `t` cycles Tuning · `1`–`6` String Lock · `i` reopens the input picker ·
 `+`/`-` adjust Reference Pitch · `?` keymap · `q`/`Esc` quit.
 
+`?` opens a recap of every binding above as an overlay on the current readout, so the player is
+never stuck guessing a key mid-session. The same key (or `Esc`) dismisses it. It only covers the
+screen — analysis keeps running underneath, so reopening the tuner shows an unpaused reading, not
+a stale one.
+
 ### Configuration
 
 XDG config path. Persists Input Device, Input Channel, Tuning, Mode and Reference Pitch. A missing
