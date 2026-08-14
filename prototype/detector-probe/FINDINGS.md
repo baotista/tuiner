@@ -91,16 +91,64 @@ the range where casual testing never looks:
   k=30 is 4380). Clamping the probe to the coarse ceiling silently pins every `k` to 1 and makes
   refinement inert while still appearing to run.
 
-## 6. Still unanswered — needs real audio
+## 6. Real-audio phase — constants pinned
 
-| Constant | Status |
-|---|---|
-| Clarity threshold | provisional 0.8. Clean synthetic 0.99–1.00; MacBook room noise at −60 dBFS gave 0.11–0.68 (p95 0.64). 0.8 sits in the gap, but real mains hum and a strummed chord are untested. |
-| Level floor | unmeasured. MacBook mic room noise was −62 to −50 dBFS; a plugged-in guitar via an interface will be far louder. Needs both. |
-| Actual B for real strings | unmeasured, and it sets the accuracy bias in §4. Wound bass strings and plain steel differ. |
+Measured over four clips recorded at 44.1 kHz (`corpus-scratch-PROTOTYPE/`): a bass low E, a guitar
+top E, a strummed chord, and an intended hum clip. 1112 note frames, 564 chord frames.
 
-Notably, **0 of 135 room-noise frames returned "no periodicity found"** — the detector always finds
-*something*. Clarity does all of the rejection work, exactly as the design assumed.
+Note the sample rate: the device ran at **44.1 kHz, not 48 kHz**, giving a 7541-sample window rather
+than 8208. Sizing the window in milliseconds rather than samples handled this with no special case.
+
+### Clarity threshold — 0.90, not the provisional 0.8
+
+| threshold | note frames kept | chord frames admitted |
+|---|---|---|
+| 0.80 | 95.5% | **31.6%** |
+| 0.85 | 92.7% | 9.2% |
+| **0.90** | **91.3%** | **4.1%** |
+| 0.95 | 76.6% | 2.3% |
+
+0.8 lets nearly a third of chord frames through. 0.90 is the knee. The residual 4% arrives as isolated
+frames, which median-3 filtering suppresses before they reach the display.
+
+### Level floor — −55 dBFS, with a caveat
+
+The guitar clip's level histogram has a genuinely empty valley:
+
+```
+ -70..-65 dB  ##############   56     <- silent gaps
+ -65..-60 dB  ####             17
+ -60..-55 dB                    0     <- nothing here
+ -55..-50 dB                    0
+ -50..-45 dB  ##                9     <- real notes
+ -45..-40 dB  #############   155
+ -40..-35 dB  ###############  220
+ -35..-30 dB  ########         107
+```
+
+**Caveat: this is gain-dependent.** An interface's input gain moves the whole distribution, so a fixed
+dBFS floor calibrated here will not transfer to a different rig. Whether to use a fixed floor or track
+the noise floor adaptively is a design decision, not something the prototype settles.
+
+### Both gates are necessary — neither is redundant
+
+- Frames below −60 dBFS (actual silence) reach clarity **0.94**. Clarity alone cannot reject silence.
+- Chord frames sit at −54..−33 dBFS, inside the note range. Level alone cannot reject chords.
+
+### Q1 answered definitively on real strings
+
+`k_max_signal == k_max_window` in every level band: bass p50 = 5 against a window limit of 5, guitar
+p50 = 42 against 42. And it does not decay — the guitar holds k = 42 in both the −30..−40 dB band and
+below −40 dB. `k` is never limited by the signal, on real audio, through full decay. Confirms §2 and §3.
+
+## 7. Still open
+
+- **The hum clip is unusable.** `hum.wav` is digital silence: 99.85% of samples are exactly zero, peak
+  1 LSB, −118 dBFS RMS. The input was dead — nothing connected, or the wrong channel. It establishes a
+  true-silence baseline but says nothing about mains hum, which is the realistic rejection case and the
+  one that fires when the player is *not* playing. **Needs re-recording with a live input.**
+- **The Level floor is provisional** until that re-record, and gain-dependence is unresolved.
+- **Actual `B` for these strings** is unmeasured, and it sets the accuracy bias in §4.
 
 ## Reproducing
 

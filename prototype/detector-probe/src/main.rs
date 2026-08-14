@@ -26,7 +26,7 @@ mod detect;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use detect::{Detector, nearest_note};
+use detect::{nearest_note, Detector};
 
 const WINDOW_MS: f32 = 171.0;
 const HOP_MS: f32 = 21.0;
@@ -48,6 +48,9 @@ struct Args {
     harmonic_decay: Option<f32>,
     inharmonicity: Option<f32>,
     partials: Option<usize>,
+    wav_in: Option<String>,
+    verbose: bool,
+    csv: bool,
 }
 
 fn parse_args() -> Args {
@@ -66,6 +69,9 @@ fn parse_args() -> Args {
         harmonic_decay: None,
         inharmonicity: None,
         partials: None,
+        wav_in: None,
+        verbose: false,
+        csv: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -79,10 +85,17 @@ fn parse_args() -> Args {
             "--harmonic-decay" => a.harmonic_decay = it.next().and_then(|v| v.parse().ok()),
             "--inharmonicity" => a.inharmonicity = it.next().and_then(|v| v.parse().ok()),
             "--partials" => a.partials = it.next().and_then(|v| v.parse().ok()),
+            "--wav-in" => a.wav_in = it.next(),
+            "--verbose" => a.verbose = true,
+            "--csv" => a.csv = true,
             "--device" => a.device = it.next(),
             "--channel" => {
                 // 1-based on the command line, matching the labels on an interface's front panel.
-                a.channel = it.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).saturating_sub(1);
+                a.channel = it
+                    .next()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .saturating_sub(1);
             }
             "--tag" => a.tag = it.next().unwrap_or_else(|| "untagged".into()),
             "--record" => a.record = it.next(),
@@ -105,7 +118,11 @@ fn synth(hz: f32, sr: f32, n: usize, args: &Args) -> Vec<f32> {
     let max_h = (((sr * 0.45) / hz).floor() as usize).min(args.partials.unwrap_or(usize::MAX));
     let b = args.inharmonicity.unwrap_or(0.0);
     for h in 1..=max_h.max(1) {
-        let amp = if h == 1 && args.weak_fundamental { 0.10 } else { 1.0 / h as f32 };
+        let amp = if h == 1 && args.weak_fundamental {
+            0.10
+        } else {
+            1.0 / h as f32
+        };
         let phase = (h as f32 * 1.7).sin() * std::f32::consts::PI;
         // Stiff-string inharmonicity: partial h sits at h·f0·sqrt(1 + B·h²), not h·f0. The
         // signal is therefore not strictly periodic, and the mismatch compounds with lag —
@@ -134,10 +151,20 @@ fn synth(hz: f32, sr: f32, n: usize, args: &Args) -> Vec<f32> {
 }
 
 const SWEEP: [(&str, f32); 14] = [
-    ("B0", 30.868), ("E1", 41.203), ("A1", 55.000), ("D2", 73.416),
-    ("E2", 82.407), ("G2", 97.999), ("A2", 110.000), ("D3", 146.832),
-    ("G3", 195.998), ("B3", 246.942), ("E4", 329.628), ("A4", 440.000),
-    ("E5", 659.255), ("E6", 1318.510),
+    ("B0", 30.868),
+    ("E1", 41.203),
+    ("A1", 55.000),
+    ("D2", 73.416),
+    ("E2", 82.407),
+    ("G2", 97.999),
+    ("A2", 110.000),
+    ("D3", 146.832),
+    ("G3", 195.998),
+    ("B3", 246.942),
+    ("E4", 329.628),
+    ("A4", 440.000),
+    ("E5", 659.255),
+    ("E6", 1318.510),
 ];
 
 /// Accuracy validation against exactly-known truth. This is the claim ADR 0001 rests on:
@@ -147,7 +174,10 @@ fn run_synthetic(args: &Args) {
     let window = (WINDOW_MS / 1000.0 * sr).round() as usize;
     let mut det = Detector::new(sr, window, MIN_HZ, MAX_HZ);
 
-    println!("synthetic accuracy sweep — sr {} Hz, window {window} ({:.1} ms)", sr as u32, WINDOW_MS);
+    println!(
+        "synthetic accuracy sweep — sr {} Hz, window {window} ({:.1} ms)",
+        sr as u32, WINDOW_MS
+    );
     if args.weak_fundamental {
         println!("fundamental attenuated to 10% (bass pickup mimic)");
     }
@@ -163,7 +193,10 @@ fn run_synthetic(args: &Args) {
     if let Some(n) = args.partials {
         println!("partials limited to {n} (equivalent to a low-pass at {n}x f0)");
     }
-    println!("\n{:<5} {:>10}  {:>11}  {:>11}  {:>6} {:>5} {:>7}", "note", "truth Hz", "coarse err", "refined err", "k", "kwin", "clarity");
+    println!(
+        "\n{:<5} {:>10}  {:>11}  {:>11}  {:>6} {:>5} {:>7}",
+        "note", "truth Hz", "coarse err", "refined err", "k", "kwin", "clarity"
+    );
     println!("{}", "-".repeat(66));
 
     let list: Vec<(&str, f32)> = match args.synthetic {
@@ -185,10 +218,14 @@ fn run_synthetic(args: &Args) {
                 );
                 if args.k_table {
                     for p in &r.probes {
-                        println!("        k={:3} nsdf={:.3} implied={:9.3}Hz err={:+7.2}\u{a2} {}",
-                            p.k, p.nsdf, p.implied_hz,
+                        println!(
+                            "        k={:3} nsdf={:.3} implied={:9.3}Hz err={:+7.2}\u{a2} {}",
+                            p.k,
+                            p.nsdf,
+                            p.implied_hz,
                             1200.0 * (p.implied_hz / truth).log2(),
-                            if p.found { "found" } else { "LOST" });
+                            if p.found { "found" } else { "LOST" }
+                        );
                     }
                 }
             }
@@ -198,12 +235,87 @@ fn run_synthetic(args: &Args) {
     println!("\nworst refined error across sweep: {worst_refined:.2}\u{a2}  (requirement: \u{2264}1.00\u{a2})");
 }
 
+
+/// Run the detector over a recorded file instead of live audio. Makes calibration reproducible:
+/// thresholds can be swept over the same clip rather than asking someone to replay it.
+fn run_wav(path: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let mut rd = hound::WavReader::open(path)?;
+    let spec = rd.spec();
+    let sr = spec.sample_rate as f32;
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            rd.samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / max).collect()
+        }
+        hound::SampleFormat::Float => rd.samples::<f32>().filter_map(|s| s.ok()).collect(),
+    };
+    let samples: Vec<f32> = if spec.channels > 1 {
+        raw.iter().step_by(spec.channels as usize).copied().collect()
+    } else {
+        raw
+    };
+
+    let window = (WINDOW_MS / 1000.0 * sr).round() as usize;
+    let hop = (HOP_MS / 1000.0 * sr).round() as usize;
+    let tag = if args.tag == "untagged" {
+        std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+    } else {
+        args.tag.clone()
+    };
+
+    if args.csv {
+        // header emitted by the caller
+    } else {
+        println!("file        {path}");
+    }
+    if !args.csv {
+    println!("audio       {} ch @ {} Hz, {:.2} s", spec.channels, sr as u32, samples.len() as f32 / sr);
+    println!("framing     window {window} ({:.1} ms), hop {hop} ({:.1} ms)",
+        window as f32 / sr * 1000.0, hop as f32 / sr * 1000.0);
+    }
+
+    let mut det = Detector::new(sr, window, MIN_HZ, MAX_HZ);
+    let mut stats = Stats::default();
+    let mut pos = 0usize;
+    while pos + window <= samples.len() {
+        let frame = &samples[pos..pos + window];
+        let rms = (frame.iter().map(|s| s * s).sum::<f32>() / window as f32).sqrt();
+        let db = if rms > 0.0 { 20.0 * rms.log10() } else { -120.0 };
+        let r = det.analyse(frame);
+        if args.csv {
+            match &r {
+                Some(r) => println!("{tag},{:.4},{db:.2},{:.4},{:.3},{}", pos as f32 / sr, r.clarity, r.refined_hz, r.k_used),
+                None => println!("{tag},{:.4},{db:.2},,,", pos as f32 / sr),
+            }
+        }
+        if args.verbose {
+            let t = pos as f32 / sr;
+            match &r {
+                Some(r) => {
+                    let (n, c) = nearest_note(r.refined_hz);
+                    println!("t={t:5.2}  lvl={db:6.1}dB  clar={:.3}  {:8.2}Hz {n}{c:+6.1}c  k={:3}",
+                        r.clarity, r.refined_hz, r.k_used);
+                }
+                None => println!("t={t:5.2}  lvl={db:6.1}dB  clar=  --"),
+            }
+        }
+        stats.push(db, r.as_ref());
+        pos += hop;
+    }
+    if !args.csv { stats.report(&tag, sr, window, hop); }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
 
     if args.sweep || args.synthetic.is_some() {
         run_synthetic(&args);
         return Ok(());
+    }
+
+    if let Some(path) = args.wav_in.clone() {
+        return run_wav(&path, &args);
     }
 
     let host = cpal::default_host();
@@ -325,7 +437,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = started.elapsed().as_secs_f32();
             let frame = &hist[..window];
             let rms = (frame.iter().map(|s| s * s).sum::<f32>() / window as f32).sqrt();
-            let db = if rms > 0.0 { 20.0 * rms.log10() } else { -120.0 };
+            let db = if rms > 0.0 {
+                20.0 * rms.log10()
+            } else {
+                -120.0
+            };
 
             match det.analyse(frame) {
                 Some(r) => {
@@ -420,7 +536,10 @@ impl Stats {
                 self.k_win.push(r.k_max_window as f32);
                 let shift = 1200.0 * (r.refined_hz / r.coarse_hz).log2();
                 self.refine_shift.push(shift.abs());
-                let bucket = BUCKETS.iter().position(|&(_, floor)| db > floor).unwrap_or(3);
+                let bucket = BUCKETS
+                    .iter()
+                    .position(|&(_, floor)| db > floor)
+                    .unwrap_or(3);
                 self.decay.push((bucket, r.k_max_signal as f32));
             }
             None => self.silent_frames += 1,
