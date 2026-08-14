@@ -81,6 +81,9 @@ recorded at 44.1 kHz — which incidentally exercised the millisecond-sized wind
   filtering removes them before display.
 - **`k` is never signal-limited on real strings either.** `k_max_signal == k_max_window` in every level
   band, and it does not decay — the guitar held k = 42 both above and below −40 dBFS.
+- **No octave errors on bass low E**, the classic MPM failure mode. The clip happens to alternate E1
+  and E2 roughly every second; the detector tracked all ten transitions as clean runs of 40–74 frames
+  with no flapping at the boundary.
 - **Both gates are load-bearing.** Silence below −60 dBFS reaches clarity 0.94, so Clarity cannot reject
   silence; chords sit at −54..−33 dBFS inside the note range, so Level cannot reject chords.
 - **The Level floor is ~−55 dBFS** for the rig measured, sitting in a genuinely empty histogram valley —
