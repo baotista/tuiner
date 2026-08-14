@@ -21,7 +21,7 @@
 //! go.
 
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -29,6 +29,7 @@ use rtrb::RingBuffer;
 use tuiner::audio::{AudioSource, EnumeratedDevice, LevelMeter, LiveCapture, list_input_devices};
 use tuiner::picker::{DeviceEntry, Outcome, Picker, Selection, Step};
 use tuiner::pipeline::{Frame, Pipeline, Polled};
+use tuiner::strobe::Strobe;
 use tuiner::ui::{self, PickerView, Readout};
 use tuiner::{pitch, window_samples};
 
@@ -266,6 +267,13 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     let handle = Box::new(source).start(producer);
     let mut pipeline = Pipeline::new(consumer, sample_rate);
 
+    let mut strobe = Strobe::new();
+    // Set only while a Pitch is live, and to the moment it was last live — not wall-clock time
+    // across a Silent gap. That keeps a genuine render stall (which leaves this untouched while
+    // the string keeps sounding) distinguishable from the player simply not playing for a while
+    // (which must not read as a stall once they start again).
+    let mut last_pitched: Option<Instant> = None;
+
     let mut readout = Readout::Listening;
     loop {
         if handle.disconnected() {
@@ -284,7 +292,34 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
         }
 
         match pipeline.poll() {
-            Polled::Frame(frame) => readout = to_readout(frame),
+            Polled::Frame(frame) => {
+                let live = matches!(frame, Frame::Pitched { .. });
+                readout = match note_reading(frame) {
+                    Some((note, hz, cents, dimmed)) => {
+                        if live {
+                            let target = pitch::target_hz(hz, cents);
+                            let now = Instant::now();
+                            if let Some(prev) = last_pitched {
+                                strobe.advance(hz, target, now.duration_since(prev).as_secs_f32());
+                            }
+                            last_pitched = Some(now);
+                        } else {
+                            last_pitched = None;
+                        }
+                        Readout::Reading {
+                            note,
+                            hz,
+                            cents,
+                            dimmed,
+                            strobe_phase: strobe.phase(),
+                        }
+                    }
+                    None => {
+                        last_pitched = None;
+                        Readout::Listening
+                    }
+                };
+            }
             Polled::Ended => return TuningExit::DeviceLost,
             Polled::Pending => {}
         }
@@ -295,22 +330,19 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     }
 }
 
-fn to_readout(frame: Frame) -> Readout {
+/// The note/hz/cents/dimmed a `Frame` reads as, or `None` when there's nothing to show at all
+/// (`Unpitched`, or `Silent` with no held reading yet).
+fn note_reading(frame: Frame) -> Option<(String, f32, f32, bool)> {
     let (hz, dimmed) = match frame {
         Frame::Pitched { hz, .. } => (hz, false),
-        Frame::Unpitched => return Readout::Listening,
+        Frame::Unpitched => return None,
         Frame::Silent {
             held: Some((hz, _clarity)),
         } => (hz, true),
-        Frame::Silent { held: None } => return Readout::Listening,
+        Frame::Silent { held: None } => return None,
     };
     let (note, cents) = pitch::nearest_note(hz, pitch::DEFAULT_REFERENCE_PITCH);
-    Readout::Reading {
-        note,
-        hz,
-        cents,
-        dimmed,
-    }
+    Some((note, hz, cents, dimmed))
 }
 
 #[cfg(test)]

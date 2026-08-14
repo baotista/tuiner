@@ -1,10 +1,13 @@
-//! The Chromatic Mode readout: nearest Note, sounding Pitch, Deviation, and a coarse ±50 cent
-//! bar. Written as a pure function of a small view-model (`Readout`), not of `pipeline::Frame`
-//! directly, so it renders — and tests — without any audio plumbing.
+//! The Chromatic Mode readout: nearest Note, sounding Pitch, Deviation, a coarse ±50 cent bar,
+//! and the Strobe. Written as a pure function of a small view-model (`Readout`), not of
+//! `pipeline::Frame` or `strobe::Strobe` directly, so it renders — and tests — without any audio
+//! plumbing.
 //!
 //! Palette is blue for flat, orange for sharp, bright neutral for in tune — deliberately not
 //! green and red, per ADR 0003. Hue carries direction only; magnitude comes from the bar
-//! marker's position, readable with colour ignored entirely.
+//! marker's position and the Strobe's drift rate, readable with colour ignored entirely.
+
+use std::f32::consts::TAU;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -18,6 +21,11 @@ use crate::pitch::IN_TUNE_TOLERANCE_CENTS;
 /// How far the coarse bar reaches in either direction. The Strobe, not this bar, carries fine
 /// precision past this range (ADR 0002) — this is only the coarse half.
 const BAR_RANGE_CENTS: f32 = 50.0;
+
+/// Columns per full band cycle of the Strobe pattern — one full phase revolution (`TAU`) maps to
+/// exactly one shift of this many columns, so the pattern returns to how it looked at the start
+/// of the cycle.
+const STROBE_PERIOD: usize = 6;
 
 const COLOR_FLAT: Color = Color::Rgb(90, 150, 230);
 const COLOR_SHARP: Color = Color::Rgb(230, 145, 60);
@@ -34,6 +42,9 @@ pub enum Readout {
         hz: f32,
         cents: f32,
         dimmed: bool,
+        /// The Strobe's current phase accumulator reading, in radians — frozen at whatever it
+        /// last was while `dimmed`, since nothing is sounding to advance it against.
+        strobe_phase: f32,
     },
 }
 
@@ -53,6 +64,7 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout) {
             hz,
             cents,
             dimmed,
+            strobe_phase,
         } => {
             let (color, direction) = deviation_style(*cents);
             let mut style = Style::default().fg(color);
@@ -68,7 +80,8 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout) {
             ]);
 
             let bar = bar_line(*cents, inner.width as usize, style);
-            frame.render_widget(Paragraph::new(vec![header, bar]), inner);
+            let strobe = strobe_line(*strobe_phase, inner.width as usize, style);
+            frame.render_widget(Paragraph::new(vec![header, bar, strobe]), inner);
         }
     }
 }
@@ -111,6 +124,28 @@ fn bar_line(cents: f32, width: usize, style: Style) -> Line<'static> {
             '─'
         });
     }
+    Line::from(Span::styled(s, style))
+}
+
+/// A banded pattern, `width` cells wide, offset by the Strobe's current phase (ADR 0002). Drawn
+/// fresh every frame from `phase` alone rather than kept as widget state — apparent motion comes
+/// from the offset changing between renders as `strobe::Strobe` advances, not from anything this
+/// function remembers.
+fn strobe_line(phase: f32, width: usize, style: Style) -> Line<'static> {
+    if width == 0 {
+        return Line::from(Span::raw(""));
+    }
+    let offset = (phase / TAU * STROBE_PERIOD as f32).round() as isize;
+    let s: String = (0..width)
+        .map(|i| {
+            let banded = (i as isize - offset).rem_euclid(STROBE_PERIOD as isize) as usize;
+            if banded < STROBE_PERIOD / 2 {
+                '█'
+            } else {
+                '·'
+            }
+        })
+        .collect();
     Line::from(Span::styled(s, style))
 }
 
@@ -245,6 +280,7 @@ mod tests {
             hz: 82.0,
             cents,
             dimmed: false,
+            strobe_phase: 0.0,
         }
     }
 
@@ -445,5 +481,65 @@ mod tests {
         assert_eq!(level_bar(0.0, 10), "█".repeat(10));
         assert_eq!(level_bar(METER_FLOOR_DB, 10), "·".repeat(10));
         assert_eq!(level_bar(-120.0, 10), "·".repeat(10));
+    }
+
+    fn reading_at_phase(strobe_phase: f32) -> Readout {
+        Readout::Reading {
+            note: "G3".into(),
+            hz: 196.0,
+            cents: -0.5,
+            dimmed: false,
+            strobe_phase,
+        }
+    }
+
+    #[test]
+    fn strobe_at_the_same_phase_renders_an_identical_stationary_pattern() {
+        let first = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 6));
+        let second = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 6));
+        assert_eq!(
+            first, second,
+            "a stationary Deviation must not shift the rendered pattern"
+        );
+    }
+
+    #[test]
+    fn strobe_at_a_different_phase_shifts_the_rendered_pattern() {
+        let at_zero = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 6));
+        let advanced = buffer_text(&render_to_buffer(&reading_at_phase(1.0), 40, 6));
+        assert_ne!(
+            at_zero, advanced,
+            "a moved Deviation must shift the rendered pattern"
+        );
+    }
+
+    #[test]
+    fn strobe_pattern_never_overflows_at_various_widths() {
+        // Same rationale as `bar_never_overflows_at_various_terminal_widths`: TestBackend panics
+        // on any out-of-bounds write, so simply completing draw() at every width proves it fit.
+        for width in [0u16, 1, 2, 3, 6, 7, 30, 120] {
+            let buf = render_to_buffer(&reading_at_phase(2.5), width, 6);
+            assert_eq!(buf.area.width, width);
+        }
+    }
+
+    #[test]
+    fn reading_renders_a_strobe_line_below_the_bar() {
+        let readout = reading_at_phase(1.0);
+        let buf = render_to_buffer(&readout, 60, 8);
+        let text = buffer_text(&buf);
+        // Three content rows (header, bar, strobe) must all render distinct non-blank lines.
+        let content_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                !l.trim_start_matches(['│', ' '])
+                    .trim_end_matches(['│', ' '])
+                    .is_empty()
+            })
+            .collect();
+        assert!(
+            content_lines.len() >= 3,
+            "expected header, bar and strobe lines, got:\n{text}"
+        );
     }
 }

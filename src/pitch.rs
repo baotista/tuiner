@@ -30,9 +30,28 @@ pub fn nearest_note(hz: f32, reference_pitch: f32) -> (String, f32) {
     (name, cents)
 }
 
+/// The Target Pitch a detected `hz` is `cents` away from — the inverse of the Deviation half of
+/// `nearest_note`. Exists for the Strobe's phase accumulator, which needs a Target Pitch in
+/// hertz rather than a Deviation in cents.
+pub fn target_hz(hz: f32, cents: f32) -> f32 {
+    hz / 2f32.powf(cents / 1200.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_hz_inverts_nearest_notes_deviation() {
+        let hz = 195.5;
+        let (_note, cents) = nearest_note(hz, DEFAULT_REFERENCE_PITCH);
+        let target = target_hz(hz, cents);
+        let (_note2, roundtrip_cents) = nearest_note(target, DEFAULT_REFERENCE_PITCH);
+        assert!(
+            roundtrip_cents.abs() < 0.01,
+            "expected the Target Pitch to read as ~0 Deviation from itself, got {roundtrip_cents}"
+        );
+    }
 
     #[test]
     fn b0_reads_correctly() {
