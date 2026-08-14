@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 cpal = "0.18"
 hound = "3.5"
+ratatui = "0.30.2"
 realfft = "3.5"
 rtrb = "0.3"

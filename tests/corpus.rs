@@ -6,8 +6,8 @@
 use rtrb::RingBuffer;
 use tuiner::audio::{AudioSource, WavSource};
 use tuiner::detect::Reading;
-use tuiner::pipeline::{self, Frame};
-use tuiner::{LOWPASS_MULT, MAX_HZ, MIN_HZ, detect, hop_samples, window_samples};
+use tuiner::pipeline::{Frame, Pipeline};
+use tuiner::{LOWPASS_MULT, MAX_HZ, MIN_HZ, detect, hop_samples, pitch, window_samples};
 
 fn frames_from_clip(path: &str) -> Vec<Frame> {
     let source = WavSource::open(path).expect("corpus clip must be present");
@@ -17,8 +17,15 @@ fn frames_from_clip(path: &str) -> Vec<Frame> {
     let (producer, consumer) = RingBuffer::<f32>::new(window * 4);
     let _handle = Box::new(source).start(producer);
 
+    let mut pipeline = Pipeline::new(consumer, sample_rate);
     let mut frames = Vec::new();
-    pipeline::run(consumer, sample_rate, |frame| frames.push(frame));
+    loop {
+        let ended = pipeline.drain(|frame| frames.push(frame));
+        if ended {
+            break;
+        }
+        std::thread::yield_now();
+    }
     frames
 }
 
@@ -116,7 +123,7 @@ fn bass_low_e_produces_a_large_majority_of_pitched_frames_with_no_octave_errors(
 
     for frame in &frames {
         if let Frame::Pitched { hz, .. } = frame {
-            let (note, _cents) = detect::nearest_note(*hz);
+            let (note, _cents) = pitch::nearest_note(*hz, pitch::DEFAULT_REFERENCE_PITCH);
             assert!(
                 note == "E1" || note == "E2",
                 "bass low E clip read {note}, expected only E1 or E2 — an octave error"
@@ -137,7 +144,7 @@ fn bass_low_e_raw_readings_show_no_octave_errors_at_clarity_090() {
         "expected some raw readings from the bass low E clip"
     );
     for r in readings.iter().filter(|r| r.clarity >= 0.90) {
-        let (note, _cents) = detect::nearest_note(r.refined_hz);
+        let (note, _cents) = pitch::nearest_note(r.refined_hz, pitch::DEFAULT_REFERENCE_PITCH);
         assert!(
             note == "E1" || note == "E2",
             "raw reading at clarity {:.2} read {note}, expected only E1 or E2 — an octave error",

@@ -353,20 +353,6 @@ fn parabolic(y: &[f32], t: usize) -> (f32, f32) {
     (t as f32 + delta, y1 - 0.25 * (y0 - y2) * delta)
 }
 
-const NAMES: [&str; 12] = [
-    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-];
-
-/// Nearest Note plus Deviation from it, at Reference Pitch A4 = 440 Hz.
-pub fn nearest_note(hz: f32) -> (String, f32) {
-    let midi = 69.0 + 12.0 * (hz / 440.0).log2();
-    let nearest = midi.round();
-    let cents = (midi - nearest) * 100.0;
-    let n = nearest as i32;
-    let name = format!("{}{}", NAMES[(n.rem_euclid(12)) as usize], n / 12 - 1);
-    (name, cents)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
