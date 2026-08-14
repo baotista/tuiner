@@ -14,15 +14,41 @@
 use std::f32::consts::TAU;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::picker::{DeviceEntry, Step};
 use crate::pitch::IN_TUNE_TOLERANCE_CENTS;
 use crate::trail::TrailSample;
 use crate::tuning::StringStatus;
+
+/// Below this width or height, refuse outright (issue #11) rather than render a Cockpit too
+/// cramped to be legible.
+const MIN_SUPPORTED_WIDTH: u16 = 40;
+const MIN_SUPPORTED_HEIGHT: u16 = 12;
+
+/// Width of the Headstock sidebar column, wide enough for the sprite, a join gap, and the panel.
+const HEADSTOCK_SIDEBAR_WIDTH: u16 = 24;
+
+/// Chromatic Mode's "simpler centred layout" (PRD): a fixed-width column centred in whatever
+/// room is available, rather than the full-width main column Guided Mode's sidebar leaves behind.
+const CHROMATIC_MAIN_WIDTH: u16 = 60;
+
+/// Degradation thresholds, in inner (post-border) rows/columns. Each is nested inside the one
+/// before it — Trail's condition requires Headstock-space's, which requires the coarse bar's —
+/// so the drop order issue #11 specifies (Trail, then Headstock, then the bar) holds by
+/// construction, regardless of the exact numbers chosen here. Note, Deviation and the Strobe
+/// never appear in this ladder at all: they are the irreducible core and are always drawn.
+///
+/// `BAR_MIN_HEIGHT` is deliberately set just above `MIN_SUPPORTED_HEIGHT`'s inner floor (10) —
+/// at the smallest supported size the bar must already be gone too, leaving exactly the
+/// irreducible core the PRD names, not the core-plus-bar a lower threshold would leave behind.
+const BAR_MIN_HEIGHT: usize = 11; // header + Strobe + bar, with a little headroom besides
+const HEADSTOCK_MIN_WIDTH: usize = 60; // the sidebar plus a still-legible main column
+const HEADSTOCK_MIN_HEIGHT: usize = 12;
+const TRAIL_MIN_HEIGHT: usize = 16; // enough headroom that the Trail is worth showing at all
 
 /// How far the coarse bar reaches in either direction. The Strobe, not this bar, carries fine
 /// precision past this range (ADR 0002) — this is only the coarse half.
@@ -91,30 +117,62 @@ pub enum Readout {
     },
 }
 
+/// Whether the coarse bar, the Headstock sidebar, and the Deviation Trail each have room, given
+/// inner (post-border) dimensions. Nested — `trail` requires `headstock_space`, which requires
+/// `bar` — so the drop order issue #11 specifies (Trail first, then Headstock, then the bar)
+/// holds by construction: it is never possible for a lower-priority panel's field to be true
+/// while a higher-priority one's is false. Note, Deviation and the Strobe never appear here at
+/// all — they are the irreducible core and are always drawn regardless of size.
+struct DegradationTiers {
+    bar: bool,
+    headstock_space: bool,
+    trail: bool,
+}
+
+fn degradation_tiers(inner_width: usize, inner_height: usize) -> DegradationTiers {
+    let bar = inner_height >= BAR_MIN_HEIGHT;
+    let headstock_space =
+        bar && inner_width >= HEADSTOCK_MIN_WIDTH && inner_height >= HEADSTOCK_MIN_HEIGHT;
+    let trail = headstock_space && inner_height >= TRAIL_MIN_HEIGHT;
+    DegradationTiers {
+        bar,
+        headstock_space,
+        trail,
+    }
+}
+
+/// Chromatic Mode's "simpler centred layout" (PRD): a fixed-width column centred within
+/// whatever room is available, rather than the full-width main column Guided Mode's sidebar
+/// leaves behind.
+fn centered_area(area: Rect, width: u16) -> Rect {
+    let width = width.min(area.width);
+    let margin = (area.width - width) / 2;
+    Rect {
+        x: area.x + margin,
+        y: area.y,
+        width,
+        height: area.height,
+    }
+}
+
 /// `mode_label` names the border title, e.g. `"Chromatic"` or `"Guided — Guitar Standard"` —
-/// the only on-screen sign of which Mode and Tuning `Tab`/`t` last landed on, until the
-/// Cockpit's own status area (issue #11) takes that job over.
+/// the only on-screen sign of which Mode and Tuning `Tab`/`t` last landed on.
 pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str) {
+    if area.width < MIN_SUPPORTED_WIDTH || area.height < MIN_SUPPORTED_HEIGHT {
+        render_too_small(frame, area);
+        return;
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" Tuiner — {mode_label} "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let tiers = degradation_tiers(inner.width as usize, inner.height as usize);
 
     match readout {
         Readout::Listening { locked, headstock } => {
-            let mut lines = vec![Line::from("listening…")];
-            if let Some((number, note)) = locked {
-                lines.push(Line::from(format!(
-                    "[Locked: {}]",
-                    string_label(*number, note)
-                )));
-            }
-            if let Some(view) = headstock {
-                let remaining = (inner.height as usize).saturating_sub(lines.len());
-                lines.extend(headstock_and_panel_lines(view).into_iter().take(remaining));
-            }
-            frame.render_widget(Paragraph::new(lines), inner);
+            render_listening(frame, inner, &tiers, locked, headstock)
         }
         Readout::Reading {
             note,
@@ -126,44 +184,132 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
             strobe_phase,
             trail,
             headstock,
-        } => {
-            let (color, direction) = deviation_style(*cents);
-            let mut style = Style::default().fg(color);
-            if *dimmed {
-                style = style.add_modifier(Modifier::DIM);
-            }
+        } => render_reading(
+            frame,
+            inner,
+            &tiers,
+            &ReadingView {
+                note,
+                hz: *hz,
+                cents: *cents,
+                dimmed: *dimmed,
+                string_number: *string_number,
+                locked: *locked,
+                strobe_phase: *strobe_phase,
+                trail,
+                headstock,
+            },
+        ),
+    }
+}
 
-            let label = match string_number {
-                Some(n) if *locked => format!("[L] {}", string_label(*n, note)),
-                Some(n) => string_label(*n, note),
-                None => note.clone(),
-            };
-            let header = Line::from(vec![
-                Span::styled(format!("{label:<10}"), style),
-                Span::raw(format!(" {hz:>8.2} Hz   ")),
-                Span::styled(format!("{cents:+.1}c"), style),
-                Span::raw(format!("   {direction}")),
-            ]);
+/// A plain message naming the size Tuiner needs, rather than rendering a Cockpit too cramped to
+/// be legible (issue #11). No border: `area` may be smaller than a border could even occupy.
+fn render_too_small(frame: &mut Frame, area: Rect) {
+    let message = format!(
+        "Terminal too small for Tuiner — need at least {MIN_SUPPORTED_WIDTH}x{MIN_SUPPORTED_HEIGHT}, have {}x{}.",
+        area.width, area.height
+    );
+    // Wrapped, not clipped: a narrow-enough terminal would otherwise cut the message off before
+    // it ever names the size actually needed — the one thing this screen exists to say.
+    frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), area);
+}
 
-            let bar = bar_line(*cents, inner.width as usize, style);
-            let strobe = strobe_line(*strobe_phase, inner.width as usize, style);
+/// Renders the Headstock sidebar (if `tiers.headstock_space` allows it and Guided Mode has one)
+/// and returns the remaining main column — centred in Chromatic Mode's simpler layout, full
+/// width otherwise — for the caller to fill in. Named for the side effect as well as the
+/// geometry: unlike this file's other `*_line`/`*_lines` helpers, this one draws.
+fn render_headstock_sidebar_and_split(
+    frame: &mut Frame,
+    inner: Rect,
+    tiers: &DegradationTiers,
+    headstock: &Option<HeadstockView>,
+) -> Rect {
+    match headstock {
+        Some(view) if tiers.headstock_space => {
+            let cols = Layout::horizontal([
+                Constraint::Length(HEADSTOCK_SIDEBAR_WIDTH),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+            frame.render_widget(Paragraph::new(headstock_and_panel_lines(view)), cols[0]);
+            cols[1]
+        }
+        Some(_) => inner, // Guided Mode, but no room for the sidebar this size.
+        None => centered_area(inner, CHROMATIC_MAIN_WIDTH), // Chromatic Mode.
+    }
+}
 
-            let mut lines = vec![header, bar, strobe];
-            let mut remaining = (inner.height as usize).saturating_sub(lines.len());
+fn render_listening(
+    frame: &mut Frame,
+    inner: Rect,
+    tiers: &DegradationTiers,
+    locked: &Option<(u8, String)>,
+    headstock: &Option<HeadstockView>,
+) {
+    let main = render_headstock_sidebar_and_split(frame, inner, tiers, headstock);
 
-            if let Some(view) = headstock {
-                let panel = headstock_and_panel_lines(view);
-                let take = panel.len().min(remaining);
-                lines.extend(panel.into_iter().take(take));
-                remaining -= take;
-            }
+    let mut lines = vec![Line::from("listening…")];
+    if let Some((number, note)) = locked {
+        lines.push(Line::from(format!(
+            "[Locked: {}]",
+            string_label(*number, note)
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), main);
+}
 
-            if remaining > 0 {
-                lines.extend(trail_canvas(trail, inner.width as usize, remaining, style));
-            }
-            frame.render_widget(Paragraph::new(lines), inner);
+/// Everything `render_reading` needs from a `Readout::Reading` — one struct instead of nine
+/// positional parameters, since every field here is already grouped exactly this way on the
+/// enum variant itself.
+struct ReadingView<'a> {
+    note: &'a str,
+    hz: f32,
+    cents: f32,
+    dimmed: bool,
+    string_number: Option<u8>,
+    locked: bool,
+    strobe_phase: f32,
+    trail: &'a [TrailSample],
+    headstock: &'a Option<HeadstockView>,
+}
+
+fn render_reading(frame: &mut Frame, inner: Rect, tiers: &DegradationTiers, view: &ReadingView) {
+    let main = render_headstock_sidebar_and_split(frame, inner, tiers, view.headstock);
+
+    let (color, direction) = deviation_style(view.cents);
+    let mut style = Style::default().fg(color);
+    if view.dimmed {
+        style = style.add_modifier(Modifier::DIM);
+    }
+
+    let label = match view.string_number {
+        Some(n) if view.locked => format!("[L] {}", string_label(n, view.note)),
+        Some(n) => string_label(n, view.note),
+        None => view.note.to_string(),
+    };
+    let header = Line::from(vec![
+        Span::styled(format!("{label:<10}"), style),
+        Span::raw(format!(" {:>8.2} Hz   ", view.hz)),
+        Span::styled(format!("{:+.1}c", view.cents), style),
+        Span::raw(format!("   {direction}")),
+    ]);
+
+    let main_width = main.width as usize;
+    let mut lines = vec![header];
+    if tiers.bar {
+        lines.push(bar_line(view.cents, main_width, style));
+    }
+    lines.push(strobe_line(view.strobe_phase, main_width, style));
+
+    if tiers.trail {
+        let remaining = (main.height as usize).saturating_sub(lines.len());
+        if remaining > 0 {
+            lines.extend(trail_canvas(view.trail, main_width, remaining, style));
         }
     }
+
+    frame.render_widget(Paragraph::new(lines), main);
 }
 
 /// The String and Note together, e.g. `"Str 5 A2"` — used both for a matched Reading and for
@@ -725,7 +871,7 @@ mod tests {
 
     #[test]
     fn flat_deviation_instructs_to_tighten() {
-        let buf = render_to_buffer(&reading(-12.0), 60, 6);
+        let buf = render_to_buffer(&reading(-12.0), 60, 14);
         let text = buffer_text(&buf);
         assert!(text.contains("tighten"), "expected 'tighten' in:\n{text}");
         assert!(!text.contains("loosen"));
@@ -733,7 +879,7 @@ mod tests {
 
     #[test]
     fn sharp_deviation_instructs_to_loosen() {
-        let buf = render_to_buffer(&reading(12.0), 60, 6);
+        let buf = render_to_buffer(&reading(12.0), 60, 14);
         let text = buffer_text(&buf);
         assert!(text.contains("loosen"), "expected 'loosen' in:\n{text}");
         assert!(!text.contains("tighten"));
@@ -742,7 +888,7 @@ mod tests {
     #[test]
     fn in_tune_within_three_cents_says_so_and_gives_no_direction() {
         for cents in [-3.0, 0.0, 3.0] {
-            let buf = render_to_buffer(&reading(cents), 60, 6);
+            let buf = render_to_buffer(&reading(cents), 60, 14);
             let text = buffer_text(&buf);
             assert!(
                 text.contains("in tune"),
@@ -754,12 +900,12 @@ mod tests {
 
     #[test]
     fn just_outside_tolerance_gives_a_direction_not_in_tune() {
-        let buf = render_to_buffer(&reading(3.1), 60, 6);
+        let buf = render_to_buffer(&reading(3.1), 60, 14);
         let text = buffer_text(&buf);
         assert!(text.contains("loosen"));
         assert!(!text.contains("in tune"));
 
-        let buf = render_to_buffer(&reading(-3.1), 60, 6);
+        let buf = render_to_buffer(&reading(-3.1), 60, 14);
         let text = buffer_text(&buf);
         assert!(text.contains("tighten"));
         assert!(!text.contains("in tune"));
@@ -768,7 +914,7 @@ mod tests {
     #[test]
     fn no_rotation_direction_appears_anywhere() {
         for cents in [-40.0, -3.0, 0.0, 3.0, 40.0] {
-            let buf = render_to_buffer(&reading(cents), 60, 6);
+            let buf = render_to_buffer(&reading(cents), 60, 14);
             let text = buffer_text(&buf).to_lowercase();
             for word in [
                 "clockwise",
@@ -787,12 +933,27 @@ mod tests {
     }
 
     #[test]
-    fn bar_never_overflows_at_various_terminal_widths() {
+    fn bar_line_never_overflows_at_extreme_widths() {
         // TestBackend panics on any out-of-bounds write, so simply completing draw() at every
-        // width, including the extremes of the supported range and a terminal too narrow for
-        // the border to leave any interior at all, proves the bar fit.
-        for width in [0u16, 1, 2, 3, 20, 40, 60, 80, 120, 200] {
-            let buf = render_to_buffer(&reading(-49.9), width, 6);
+        // width, including down to zero, proves `bar_line` itself never writes past its width —
+        // exercised directly since `render()` now refuses anything below `MIN_SUPPORTED_WIDTH`,
+        // making these extremes unreachable through the public entry point.
+        for width in [0usize, 1, 2, 3, 20, 39] {
+            let backend = TestBackend::new(width as u16, 1);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    let line = bar_line(-49.9, width, Style::default());
+                    f.render_widget(Paragraph::new(line), f.area());
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn bar_never_overflows_at_various_supported_terminal_widths() {
+        for width in [40u16, 60, 80, 120, 200] {
+            let buf = render_to_buffer(&reading(-49.9), width, 14);
             assert_eq!(buf.area.width, width);
         }
     }
@@ -826,7 +987,7 @@ mod tests {
                 headstock: None,
             },
             60,
-            6,
+            14,
         );
         let text = buffer_text(&buf);
         assert!(text.contains("listening"));
@@ -840,7 +1001,7 @@ mod tests {
                 headstock: None,
             },
             60,
-            6,
+            14,
         );
         let text = buffer_text(&buf);
         assert!(text.contains("Locked") && text.contains("Str 5 A2"));
@@ -959,8 +1120,8 @@ mod tests {
 
     #[test]
     fn strobe_at_the_same_phase_renders_an_identical_stationary_pattern() {
-        let first = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 6));
-        let second = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 6));
+        let first = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 14));
+        let second = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 14));
         assert_eq!(
             first, second,
             "a stationary Deviation must not shift the rendered pattern"
@@ -969,8 +1130,8 @@ mod tests {
 
     #[test]
     fn strobe_at_a_different_phase_shifts_the_rendered_pattern() {
-        let at_zero = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 6));
-        let advanced = buffer_text(&render_to_buffer(&reading_at_phase(1.0), 40, 6));
+        let at_zero = buffer_text(&render_to_buffer(&reading_at_phase(0.0), 40, 14));
+        let advanced = buffer_text(&render_to_buffer(&reading_at_phase(1.0), 40, 14));
         assert_ne!(
             at_zero, advanced,
             "a moved Deviation must shift the rendered pattern"
@@ -978,11 +1139,26 @@ mod tests {
     }
 
     #[test]
-    fn strobe_pattern_never_overflows_at_various_widths() {
-        // Same rationale as `bar_never_overflows_at_various_terminal_widths`: TestBackend panics
-        // on any out-of-bounds write, so simply completing draw() at every width proves it fit.
-        for width in [0u16, 1, 2, 3, 6, 7, 30, 120] {
-            let buf = render_to_buffer(&reading_at_phase(2.5), width, 6);
+    fn strobe_line_never_overflows_at_extreme_widths() {
+        // Exercised directly, same rationale as `bar_line_never_overflows_at_extreme_widths`:
+        // `render()` now refuses anything below `MIN_SUPPORTED_WIDTH`, so widths this small are
+        // otherwise unreachable through the public entry point.
+        for width in [0usize, 1, 2, 3, 6, 7, 30, 39] {
+            let backend = TestBackend::new(width as u16, 1);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    let line = strobe_line(2.5, width, Style::default());
+                    f.render_widget(Paragraph::new(line), f.area());
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn strobe_pattern_never_overflows_at_various_supported_widths() {
+        for width in [40u16, 60, 80, 120] {
+            let buf = render_to_buffer(&reading_at_phase(2.5), width, 14);
             assert_eq!(buf.area.width, width);
         }
     }
@@ -990,7 +1166,7 @@ mod tests {
     #[test]
     fn reading_renders_a_strobe_line_below_the_bar() {
         let readout = reading_at_phase(1.0);
-        let buf = render_to_buffer(&readout, 60, 8);
+        let buf = render_to_buffer(&readout, 60, 14);
         let text = buffer_text(&buf);
         // Three content rows (header, bar, strobe) must all render distinct non-blank lines.
         let content_lines: Vec<&str> = text
@@ -1084,7 +1260,7 @@ mod tests {
             trail: vec![TrailSample::Gap; 40],
             headstock: None,
         };
-        let buf = render_to_buffer(&readout, 40, 8);
+        let buf = render_to_buffer(&readout, 70, 20);
         let text = buffer_text(&buf);
         assert!(
             !text
@@ -1107,7 +1283,7 @@ mod tests {
             trail: vec![TrailSample::Deviation(-40.0); 40],
             headstock: None,
         };
-        let buf = render_to_buffer(&readout, 40, 8);
+        let buf = render_to_buffer(&readout, 70, 20);
         let text = buffer_text(&buf);
         assert!(
             text.chars()
@@ -1129,7 +1305,16 @@ mod tests {
             trail: vec![TrailSample::Deviation(12.0); 50],
             headstock: None,
         };
-        for (width, height) in [(0u16, 0u16), (1, 1), (2, 2), (3, 6), (40, 3), (120, 20)] {
+        for (width, height) in [
+            (0u16, 0u16),
+            (1, 1),
+            (2, 2),
+            (3, 6),
+            (40, 3),
+            (40, 12),
+            (70, 20),
+            (120, 36),
+        ] {
             let buf = render_to_buffer(&readout, width, height);
             assert_eq!(buf.area.width, width);
             assert_eq!(buf.area.height, height);
@@ -1149,7 +1334,7 @@ mod tests {
             trail: Vec::new(),
             headstock: None,
         };
-        let text = buffer_text(&render_to_buffer(&readout, 60, 6));
+        let text = buffer_text(&render_to_buffer(&readout, 60, 14));
         assert!(
             text.contains("Str 5") && text.contains("A2"),
             "expected both the String number and its Note in:\n{text}"
@@ -1158,7 +1343,7 @@ mod tests {
 
     #[test]
     fn chromatic_mode_names_only_the_note_with_no_string() {
-        let text = buffer_text(&render_to_buffer(&reading(0.0), 60, 6));
+        let text = buffer_text(&render_to_buffer(&reading(0.0), 60, 14));
         assert!(
             !text.contains("Str "),
             "expected no String label in:\n{text}"
@@ -1167,7 +1352,7 @@ mod tests {
 
     #[test]
     fn the_border_title_names_the_current_mode() {
-        let backend = TestBackend::new(60, 6);
+        let backend = TestBackend::new(60, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| render(f, f.area(), &reading(0.0), "Guided — DADGAD"))
@@ -1297,7 +1482,7 @@ mod tests {
                 status: StringStatus::InTune,
             }])),
         };
-        let text = buffer_text(&render_to_buffer(&readout, 60, 10));
+        let text = buffer_text(&render_to_buffer(&readout, 70, 14));
         assert!(
             text.contains('✓'),
             "expected the panel's status symbol in:\n{text}"
@@ -1314,7 +1499,7 @@ mod tests {
                 status: StringStatus::Sounding,
             }])),
         };
-        let text = buffer_text(&render_to_buffer(&readout, 60, 10));
+        let text = buffer_text(&render_to_buffer(&readout, 70, 14));
         assert!(
             text.contains('●'),
             "expected the panel's status symbol in:\n{text}"
@@ -1346,6 +1531,273 @@ mod tests {
             let buf = render_to_buffer(&readout, width, height);
             assert_eq!(buf.area.width, width);
             assert_eq!(buf.area.height, height);
+        }
+    }
+
+    // --- Issue #11: Cockpit assembly and small-terminal degradation ---
+
+    fn sample_headstock() -> HeadstockView {
+        headstock_view(vec![
+            StringView {
+                number: 1,
+                note: "E4".into(),
+                status: StringStatus::InTune,
+            },
+            StringView {
+                number: 2,
+                note: "B3".into(),
+                status: StringStatus::Sounding,
+            },
+        ])
+    }
+
+    fn sample_trail() -> Vec<TrailSample> {
+        vec![TrailSample::Deviation(10.0); 60]
+    }
+
+    fn guided_reading(headstock: Option<HeadstockView>, trail: Vec<TrailSample>) -> Readout {
+        Readout::Reading {
+            note: "G3".into(),
+            hz: 196.0,
+            cents: 10.0,
+            dimmed: false,
+            string_number: Some(3),
+            locked: false,
+            strobe_phase: 1.0,
+            trail,
+            headstock,
+        }
+    }
+
+    fn has_braille_dot(text: &str) -> bool {
+        text.chars()
+            .any(|c| (0x2801..=0x28FF).contains(&(c as u32)))
+    }
+
+    #[test]
+    fn cockpit_at_120x36_renders_every_panel() {
+        let readout = guided_reading(Some(sample_headstock()), sample_trail());
+        let text = buffer_text(&render_to_buffer(&readout, 120, 36));
+        assert!(text.contains("Str 3"), "expected the header, got:\n{text}");
+        assert!(
+            text.contains('─') || text.contains('|'),
+            "expected the coarse bar, got:\n{text}"
+        );
+        assert!(text.contains('█'), "expected the Strobe, got:\n{text}");
+        assert!(
+            text.contains('▀') || text.contains('▄'),
+            "expected the Headstock sprite, got:\n{text}"
+        );
+        assert!(
+            text.contains("E4") && text.contains('✓'),
+            "expected the String panel, got:\n{text}"
+        );
+        assert!(
+            has_braille_dot(&text),
+            "expected the Deviation Trail, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn chromatic_mode_centres_content_with_a_visible_margin() {
+        let readout = reading(5.0); // the `reading` helper's headstock is always None
+        let text = buffer_text(&render_to_buffer(&readout, 120, 20));
+        let header_line = text.lines().find(|l| l.contains("Hz")).unwrap();
+        let after_border: String = header_line
+            .chars()
+            .skip_while(|c| *c != '│')
+            .skip(1)
+            .collect();
+        let leading_spaces = after_border.chars().take_while(|c| *c == ' ').count();
+        assert!(
+            leading_spaces > 5,
+            "expected a centred left margin, got {leading_spaces} spaces in:\n{header_line}"
+        );
+        assert!(
+            !text.contains("Str "),
+            "Chromatic Mode must show no Headstock/String label"
+        );
+    }
+
+    #[test]
+    fn centered_area_centers_within_available_width() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 10,
+        };
+        let centered = centered_area(area, 60);
+        assert_eq!(centered.width, 60);
+        assert_eq!(centered.x, 20);
+    }
+
+    #[test]
+    fn centered_area_never_exceeds_the_available_width() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 10,
+        };
+        let centered = centered_area(area, 60);
+        assert_eq!(centered.width, 30);
+        assert_eq!(centered.x, 0);
+    }
+
+    #[test]
+    fn degradation_tiers_are_strictly_nested() {
+        // Trail's condition must never hold unless Headstock-space's does too, which must never
+        // hold unless the bar's does — regardless of the specific thresholds, by construction.
+        for w in (0..=140).step_by(4) {
+            for h in (0..=40).step_by(2) {
+                let tiers = degradation_tiers(w, h);
+                assert!(
+                    !tiers.trail || tiers.headstock_space,
+                    "trail without headstock-space at {w}x{h}"
+                );
+                assert!(
+                    !tiers.headstock_space || tiers.bar,
+                    "headstock-space without bar at {w}x{h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_size_shows_bar_headstock_and_trail() {
+        let tiers = degradation_tiers(118, 34); // 120x36 inner
+        assert!(tiers.bar && tiers.headstock_space && tiers.trail);
+    }
+
+    #[test]
+    fn medium_terminal_drops_the_trail_but_keeps_the_headstock_and_bar() {
+        let readout = guided_reading(Some(sample_headstock()), sample_trail());
+        let text = buffer_text(&render_to_buffer(&readout, 70, 16));
+        assert!(
+            !has_braille_dot(&text),
+            "Trail should be dropped first, got:\n{text}"
+        );
+        assert!(
+            text.contains("E4") && text.contains('✓'),
+            "Headstock/panel should still show, got:\n{text}"
+        );
+        assert!(
+            text.contains('─') || text.contains('|'),
+            "the coarse bar should still show, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrow_terminal_drops_the_headstock_and_trail_but_keeps_the_bar() {
+        let readout = guided_reading(Some(sample_headstock()), sample_trail());
+        let text = buffer_text(&render_to_buffer(&readout, 50, 30));
+        assert!(
+            !text.contains("E4"),
+            "Headstock/panel should be dropped next, got:\n{text}"
+        );
+        assert!(
+            !has_braille_dot(&text),
+            "Trail must already be gone too (nested), got:\n{text}"
+        );
+        assert!(
+            text.contains('─') || text.contains('|'),
+            "the coarse bar should still show, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn note_deviation_and_strobe_survive_at_the_smallest_supported_size() {
+        let readout = guided_reading(None, Vec::new());
+        let text = buffer_text(&render_to_buffer(&readout, 40, 12));
+        assert!(
+            text.contains("G3") && text.contains("196.00 Hz") && text.contains("+10.0c"),
+            "expected the Note and Deviation at the floor, got:\n{text}"
+        );
+        assert!(
+            text.contains('█'),
+            "expected the Strobe at the floor, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_coarse_bar_is_also_dropped_at_the_smallest_supported_size() {
+        // Completes the drop order at the floor: Trail and Headstock are already gone by 40x12
+        // (both need more room than that), and the bar goes too, leaving exactly the irreducible
+        // core the PRD names — not the core plus a bar a looser threshold would leave behind.
+        // ASCII '|' (the bar's centre tick) is checked rather than '─', since the outer border
+        // already draws '─' regardless of whether the bar itself is shown.
+        let readout = guided_reading(None, Vec::new());
+        let text = buffer_text(&render_to_buffer(&readout, 40, 12));
+        assert!(
+            !text.contains('|'),
+            "expected the coarse bar to be dropped at the floor too, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn at_exactly_the_minimum_size_the_app_still_renders_normally() {
+        let text = buffer_text(&render_to_buffer(&reading(0.0), 40, 12));
+        assert!(
+            text.contains("Hz"),
+            "expected normal content at the exact floor, got:\n{text}"
+        );
+        assert!(!text.contains("need at least"));
+    }
+
+    #[test]
+    fn below_the_minimum_width_the_app_states_the_size_it_needs() {
+        let text = buffer_text(&render_to_buffer(&reading(0.0), 39, 20));
+        assert!(
+            text.contains("40") && text.contains("12"),
+            "expected the required size in the message, got:\n{text}"
+        );
+        assert!(
+            !text.contains("Hz"),
+            "expected no normal readout content, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn below_the_minimum_height_the_app_states_the_size_it_needs() {
+        let text = buffer_text(&render_to_buffer(&reading(0.0), 60, 11));
+        assert!(text.contains("40") && text.contains("12"));
+        assert!(!text.contains("Hz"));
+    }
+
+    #[test]
+    fn a_tiny_terminal_does_not_panic() {
+        for (w, h) in [(0u16, 0u16), (1, 1), (5, 3), (39, 11)] {
+            let buf = render_to_buffer(&reading(0.0), w, h);
+            assert_eq!(buf.area.width, w);
+            assert_eq!(buf.area.height, h);
+        }
+    }
+
+    #[test]
+    fn resizing_mid_session_relayouts_without_corruption() {
+        let readout = guided_reading(Some(sample_headstock()), sample_trail());
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &readout, "Guided — Test"))
+            .unwrap();
+
+        for (w, h) in [
+            (40u16, 12u16),
+            (10, 5),
+            (70, 16),
+            (120, 36),
+            (39, 11),
+            (80, 24),
+        ] {
+            terminal.backend_mut().resize(w, h);
+            terminal
+                .draw(|f| render(f, f.area(), &readout, "Guided — Test"))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            assert_eq!(buf.area.width, w);
+            assert_eq!(buf.area.height, h);
         }
     }
 }
