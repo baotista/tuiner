@@ -287,8 +287,12 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     let tunings = tuning::all();
     let mut mode = Mode::Chromatic;
     let mut tuning_idx = 0usize;
+    // Which String the player has named explicitly, so matching stops refusing to guess for a
+    // fresh string that starts far too flat to fall inside any Capture Range. Only meaningful in
+    // Guided Mode; a Tuning change clears it, since the Target Pitch it referred to has changed.
+    let mut string_lock: Option<u8> = None;
 
-    let mut readout = Readout::Listening;
+    let mut readout = Readout::Listening { locked: None };
     loop {
         if handle.disconnected() {
             return TuningExit::DeviceLost;
@@ -307,7 +311,14 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                         Mode::Guided => Mode::Chromatic,
                     }
                 }
-                KeyCode::Char('t') => tuning_idx = (tuning_idx + 1) % tunings.len(),
+                KeyCode::Char('t') => {
+                    tuning_idx = (tuning_idx + 1) % tunings.len();
+                    string_lock = None;
+                }
+                KeyCode::Char(c @ '1'..='6') if mode == Mode::Guided => {
+                    let n = c.to_digit(10).expect("guarded by '1'..='6'") as u8;
+                    string_lock = toggle_string_lock(&tunings[tuning_idx], string_lock, n);
+                }
                 _ => {}
             }
         }
@@ -317,11 +328,10 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                 let live = matches!(frame, Frame::Pitched { .. });
                 readout = match hz_reading(frame) {
                     Some((hz, dimmed)) => {
-                        let (note, cents, string_number) =
-                            name_pitch(mode, &tunings[tuning_idx], hz);
+                        let named = name_pitch(mode, &tunings[tuning_idx], string_lock, hz);
                         if live {
-                            trail.push(TrailSample::Deviation(cents));
-                            let target = pitch::target_hz(hz, cents);
+                            trail.push(TrailSample::Deviation(named.cents));
+                            let target = pitch::target_hz(hz, named.cents);
                             let now = Instant::now();
                             if let Some(prev) = last_pitched {
                                 strobe.advance(hz, target, now.duration_since(prev).as_secs_f32());
@@ -334,11 +344,12 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                             last_pitched = None;
                         }
                         Readout::Reading {
-                            note,
+                            note: named.note,
                             hz,
-                            cents,
+                            cents: named.cents,
                             dimmed,
-                            string_number,
+                            string_number: named.string_number,
+                            locked: named.locked,
                             strobe_phase: strobe.phase(),
                             trail: trail.padded_samples(),
                         }
@@ -346,7 +357,9 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                     None => {
                         trail.push(TrailSample::Gap);
                         last_pitched = None;
-                        Readout::Listening
+                        Readout::Listening {
+                            locked: locked_target(mode, &tunings[tuning_idx], string_lock),
+                        }
                     }
                 };
             }
@@ -383,24 +396,104 @@ fn hz_reading(frame: Frame) -> Option<(f32, bool)> {
     }
 }
 
-/// Names `hz` per the current Mode: a bare Note in Chromatic Mode, or a String within
-/// `tuning`'s Capture Range (falling back to the nearest Note when nothing matches) in Guided
-/// Mode.
-fn name_pitch(mode: Mode, tuning: &tuning::Tuning, hz: f32) -> (String, f32, Option<u8>) {
+/// What a sounding Pitch names, and how — a bare Note, or a String matched either by Capture
+/// Range or by an active String Lock.
+struct PitchName {
+    note: String,
+    cents: f32,
+    string_number: Option<u8>,
+    /// Whether `string_number` came from a String Lock overriding Capture Range matching, rather
+    /// than a normal in-range match — the only thing distinguishing the two on screen.
+    locked: bool,
+}
+
+/// The String named by an active String Lock, if any: only in Guided Mode, and only if `tuning`
+/// still has a String numbered `string_lock` (it always will while a String Lock is set, since
+/// changing Tuning clears it — but centralising the check here keeps that rule from being
+/// restated wherever a caller needs to know whether a String Lock is currently in effect).
+fn active_lock(
+    mode: Mode,
+    tuning: &tuning::Tuning,
+    string_lock: Option<u8>,
+) -> Option<&tuning::InstrumentString> {
+    if mode != Mode::Guided {
+        return None;
+    }
+    tuning.string(string_lock?)
+}
+
+/// Names `hz` per the current Mode: a bare Note in Chromatic Mode; in Guided Mode, the locked
+/// String's Deviation however far `hz` is (ignoring `tuning`'s Capture Range) if a String Lock is
+/// active, otherwise a String within Capture Range or the nearest Note as a fallback.
+fn name_pitch(mode: Mode, tuning: &tuning::Tuning, string_lock: Option<u8>, hz: f32) -> PitchName {
+    if let Some(s) = active_lock(mode, tuning, string_lock) {
+        let Some(tuning::Match::String {
+            number,
+            note,
+            cents,
+        }) = tuning.match_locked(s.number, hz)
+        else {
+            unreachable!("active_lock only names a String this Tuning has")
+        };
+        return PitchName {
+            note,
+            cents,
+            string_number: Some(number),
+            locked: true,
+        };
+    }
+
     match mode {
         Mode::Chromatic => {
             let (note, cents) = pitch::nearest_note(hz, pitch::DEFAULT_REFERENCE_PITCH);
-            (note, cents, None)
+            PitchName {
+                note,
+                cents,
+                string_number: None,
+                locked: false,
+            }
         }
         Mode::Guided => match tuning.match_pitch(hz) {
             tuning::Match::String {
                 number,
                 note,
                 cents,
-            } => (note, cents, Some(number)),
-            tuning::Match::Note { note, cents } => (note, cents, None),
+            } => PitchName {
+                note,
+                cents,
+                string_number: Some(number),
+                locked: false,
+            },
+            tuning::Match::Note { note, cents } => PitchName {
+                note,
+                cents,
+                string_number: None,
+                locked: false,
+            },
         },
     }
+}
+
+/// The String Lock target for display purposes (String number and Note), shown even while
+/// `Readout::Listening` so a fresh string that hasn't produced a stable Pitch yet still confirms
+/// the Lock took effect. `None` outside Guided Mode, since a Chromatic readout has no String to
+/// name.
+fn locked_target(
+    mode: Mode,
+    tuning: &tuning::Tuning,
+    string_lock: Option<u8>,
+) -> Option<(u8, String)> {
+    active_lock(mode, tuning, string_lock).map(|s| (s.number, s.note.clone()))
+}
+
+/// The String Lock state after digit key `n` is pressed: locks onto String `n` if `tuning` has
+/// one, releases an existing Lock on that same String, or leaves the Lock untouched if `n` is
+/// beyond `tuning`'s String count.
+fn toggle_string_lock(tuning: &tuning::Tuning, current: Option<u8>, n: u8) -> Option<u8> {
+    if tuning.string(n).is_none() {
+        return current;
+    }
+    if current == Some(n) { None } else { Some(n) }
 }
 
 #[cfg(test)]
@@ -422,6 +515,87 @@ mod tests {
     #[test]
     fn guided_mode_label_names_the_current_tuning() {
         assert_eq!(mode_label(Mode::Guided, "DADGAD"), "Guided — DADGAD");
+    }
+
+    fn bass_standard() -> tuning::Tuning {
+        tuning::all()
+            .into_iter()
+            .find(|t| t.name == "Bass Standard")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_number_key_locks_onto_the_corresponding_string() {
+        let bass = bass_standard();
+        assert_eq!(toggle_string_lock(&bass, None, 2), Some(2));
+    }
+
+    #[test]
+    fn the_same_key_releases_an_existing_lock() {
+        let bass = bass_standard();
+        assert_eq!(toggle_string_lock(&bass, Some(2), 2), None);
+    }
+
+    #[test]
+    fn a_different_key_switches_the_lock_to_the_new_string() {
+        let bass = bass_standard();
+        assert_eq!(toggle_string_lock(&bass, Some(2), 3), Some(3));
+    }
+
+    #[test]
+    fn a_key_beyond_the_string_count_does_nothing() {
+        // Bass Standard has four Strings — key 5 is out of range.
+        let bass = bass_standard();
+        assert_eq!(toggle_string_lock(&bass, None, 5), None);
+        assert_eq!(toggle_string_lock(&bass, Some(2), 5), Some(2));
+    }
+
+    #[test]
+    fn locked_target_is_none_in_chromatic_mode_even_with_a_lock_set() {
+        let bass = bass_standard();
+        assert_eq!(locked_target(Mode::Chromatic, &bass, Some(2)), None);
+    }
+
+    #[test]
+    fn locked_target_names_the_string_and_note_in_guided_mode() {
+        let bass = bass_standard();
+        assert_eq!(
+            locked_target(Mode::Guided, &bass, Some(2)),
+            Some((2, "D2".to_string()))
+        );
+    }
+
+    #[test]
+    fn locked_target_is_none_when_nothing_is_locked() {
+        let bass = bass_standard();
+        assert_eq!(locked_target(Mode::Guided, &bass, None), None);
+    }
+
+    #[test]
+    fn name_pitch_reports_the_locked_string_however_far_the_pitch_is() {
+        let bass = bass_standard();
+        // Far below D2 (String 2) — well outside any Capture Range, exactly the fresh-string
+        // case a Lock exists for.
+        let far_flat_of_d2 = pitch::midi_to_hz(38, pitch::DEFAULT_REFERENCE_PITCH) / 4.0;
+        let named = name_pitch(Mode::Guided, &bass, Some(2), far_flat_of_d2);
+        assert_eq!(named.note, "D2");
+        assert_eq!(named.string_number, Some(2));
+        assert!(named.locked);
+        assert!(
+            named.cents < -2000.0,
+            "expected a very large flat Deviation, got {}",
+            named.cents
+        );
+    }
+
+    #[test]
+    fn name_pitch_ignores_a_lock_in_chromatic_mode() {
+        let bass = bass_standard();
+        let a1_hz = pitch::midi_to_hz(33, pitch::DEFAULT_REFERENCE_PITCH);
+        let named = name_pitch(Mode::Chromatic, &bass, Some(2), a1_hz);
+        assert_eq!(named.note, "A1");
+        assert_eq!(named.string_number, None);
+        assert!(!named.locked);
     }
 
     #[test]

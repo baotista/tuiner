@@ -39,18 +39,24 @@ const COLOR_IN_TUNE: Color = Color::Rgb(235, 235, 235);
 /// What the readout should show, independent of how it got there (live, held, or nothing yet).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Readout {
-    /// Nothing trustworthy is sounding.
-    Listening,
+    /// Nothing trustworthy is sounding. `locked` names an active String Lock (String number and
+    /// Note) even here — a fresh string is exactly the case a Lock exists for, and it often
+    /// won't produce a stable Pitch the moment the player engages it.
+    Listening { locked: Option<(u8, String)> },
     /// A Pitch reading — live if `dimmed` is false, held from before a Silent gap if true.
     Reading {
         note: String,
         hz: f32,
         cents: f32,
         dimmed: bool,
-        /// `Some(n)` in Guided Mode when the Pitch matched String `n`'s Capture Range; `None` in
-        /// Chromatic Mode, or in Guided Mode when nothing matched and `note` names the nearest
-        /// Note instead.
+        /// `Some(n)` in Guided Mode when the Pitch matched String `n` — by Capture Range, or by
+        /// an active String Lock when `locked` is true. `None` in Chromatic Mode, or in Guided
+        /// Mode when nothing matched and `note` names the nearest Note instead.
         string_number: Option<u8>,
+        /// Whether `string_number` came from a String Lock overriding Capture Range matching,
+        /// rather than a normal in-range match — the only thing distinguishing the two on
+        /// screen, since both show the same String and Note.
+        locked: bool,
         /// The Strobe's current phase accumulator reading, in radians — frozen at whatever it
         /// last was while `dimmed`, since nothing is sounding to advance it against.
         strobe_phase: f32,
@@ -71,8 +77,15 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
     frame.render_widget(block, area);
 
     match readout {
-        Readout::Listening => {
-            frame.render_widget(Paragraph::new("listening…"), inner);
+        Readout::Listening { locked } => {
+            let mut lines = vec![Line::from("listening…")];
+            if let Some((number, note)) = locked {
+                lines.push(Line::from(format!(
+                    "[Locked: {}]",
+                    string_label(*number, note)
+                )));
+            }
+            frame.render_widget(Paragraph::new(lines), inner);
         }
         Readout::Reading {
             note,
@@ -80,6 +93,7 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
             cents,
             dimmed,
             string_number,
+            locked,
             strobe_phase,
             trail,
         } => {
@@ -90,7 +104,8 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
             }
 
             let label = match string_number {
-                Some(n) => format!("Str {n} {note}"),
+                Some(n) if *locked => format!("[L] {}", string_label(*n, note)),
+                Some(n) => string_label(*n, note),
                 None => note.clone(),
             };
             let header = Line::from(vec![
@@ -111,6 +126,12 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str
             frame.render_widget(Paragraph::new(lines), inner);
         }
     }
+}
+
+/// The String and Note together, e.g. `"Str 5 A2"` — used both for a matched Reading and for
+/// naming an active String Lock while `Listening`, so the two states agree on one format.
+fn string_label(number: u8, note: &str) -> String {
+    format!("Str {number} {note}")
 }
 
 /// (colour, direction word) for a Deviation. Never names a rotation — tightening always raises
@@ -470,6 +491,7 @@ mod tests {
             cents,
             dimmed: false,
             string_number: None,
+            locked: false,
             strobe_phase: 0.0,
             trail: Vec::new(),
         }
@@ -572,9 +594,22 @@ mod tests {
 
     #[test]
     fn listening_state_names_no_note() {
-        let buf = render_to_buffer(&Readout::Listening, 60, 6);
+        let buf = render_to_buffer(&Readout::Listening { locked: None }, 60, 6);
         let text = buffer_text(&buf);
         assert!(text.contains("listening"));
+    }
+
+    #[test]
+    fn listening_state_shows_an_active_lock() {
+        let buf = render_to_buffer(
+            &Readout::Listening {
+                locked: Some((5, "A2".into())),
+            },
+            60,
+            6,
+        );
+        let text = buffer_text(&buf);
+        assert!(text.contains("Locked") && text.contains("Str 5 A2"));
     }
 
     fn render_picker_to_buffer(view: &PickerView, width: u16, height: u16) -> Buffer {
@@ -681,6 +716,7 @@ mod tests {
             cents: -0.5,
             dimmed: false,
             string_number: None,
+            locked: false,
             strobe_phase,
             trail: Vec::new(),
         }
@@ -808,6 +844,7 @@ mod tests {
             cents: 0.0,
             dimmed: false,
             string_number: None,
+            locked: false,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Gap; 40],
         };
@@ -829,6 +866,7 @@ mod tests {
             cents: 0.0,
             dimmed: false,
             string_number: None,
+            locked: false,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Deviation(-40.0); 40],
         };
@@ -849,6 +887,7 @@ mod tests {
             cents: 0.0,
             dimmed: false,
             string_number: None,
+            locked: false,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Deviation(12.0); 50],
         };
@@ -867,6 +906,7 @@ mod tests {
             cents: 0.0,
             dimmed: false,
             string_number: Some(5),
+            locked: false,
             strobe_phase: 0.0,
             trail: Vec::new(),
         };

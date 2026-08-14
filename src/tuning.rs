@@ -74,6 +74,24 @@ impl Tuning {
             }
         }
     }
+
+    /// The String numbered `number`, if this Tuning has one.
+    pub fn string(&self, number: u8) -> Option<&InstrumentString> {
+        self.strings.iter().find(|s| s.number == number)
+    }
+
+    /// Deviation against `number`'s Target Pitch, however far `hz` actually is — the String Lock
+    /// path (issue #9). Capture Range plays no part here: locking is exactly what lets a fresh
+    /// string, starting far too flat to fall inside any range, still get guidance. `None` only
+    /// if this Tuning has no String `number` at all.
+    pub fn match_locked(&self, number: u8, hz: f32) -> Option<Match> {
+        let s = self.string(number)?;
+        Some(Match::String {
+            number: s.number,
+            note: s.note.clone(),
+            cents: 1200.0 * (hz / s.target_hz).log2(),
+        })
+    }
 }
 
 /// Derives a Capture Range for every position in `sorted_target_hz` (ascending order): half the
@@ -319,5 +337,49 @@ mod tests {
             }
             Match::Note { note, .. } => panic!("expected String 6 (E2), got Note {note}"),
         }
+    }
+
+    #[test]
+    fn match_locked_reports_deviation_however_far_the_pitch_is() {
+        let standard = tuning("Guitar Standard");
+        // Exactly between A2 (String 5) and D3 — 500c apart with ~235c Capture Ranges each,
+        // leaving a dead zone in the middle that normal matching refuses to guess at all. A
+        // locked String must still report against its own Target Pitch even here.
+        let a2_hz = pitch::midi_to_hz(45, pitch::DEFAULT_REFERENCE_PITCH);
+        let dead_zone = a2_hz * 2f32.powf(250.0 / 1200.0);
+
+        assert!(matches!(
+            standard.match_pitch(dead_zone),
+            Match::Note { .. }
+        ));
+
+        match standard.match_locked(5, dead_zone) {
+            Some(Match::String {
+                number,
+                note,
+                cents,
+            }) => {
+                assert_eq!(number, 5);
+                assert_eq!(note, "A2");
+                assert!(
+                    cents > 200.0,
+                    "expected a large sharp Deviation, got {cents}"
+                );
+            }
+            other => panic!("expected a locked String match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_locked_returns_none_for_a_string_number_the_tuning_does_not_have() {
+        let bass = tuning("Bass Standard"); // only Strings 1-4
+        assert_eq!(bass.match_locked(5, 100.0), None);
+    }
+
+    #[test]
+    fn string_returns_none_for_an_out_of_range_number() {
+        let bass = tuning("Bass Standard");
+        assert!(bass.string(5).is_none());
+        assert!(bass.string(1).is_some());
     }
 }
