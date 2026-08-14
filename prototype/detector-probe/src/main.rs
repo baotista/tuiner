@@ -26,7 +26,7 @@ mod detect;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use detect::{nearest_note, Detector};
+use detect::{nearest_note, Detector, NoiseFloor};
 
 const WINDOW_MS: f32 = 171.0;
 const HOP_MS: f32 = 21.0;
@@ -51,6 +51,7 @@ struct Args {
     wav_in: Option<String>,
     verbose: bool,
     csv: bool,
+    lowpass: Option<f32>,
 }
 
 fn parse_args() -> Args {
@@ -72,6 +73,7 @@ fn parse_args() -> Args {
         wav_in: None,
         verbose: false,
         csv: false,
+        lowpass: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -88,6 +90,7 @@ fn parse_args() -> Args {
             "--wav-in" => a.wav_in = it.next(),
             "--verbose" => a.verbose = true,
             "--csv" => a.csv = true,
+            "--lowpass" => a.lowpass = it.next().and_then(|v| v.parse().ok()),
             "--device" => a.device = it.next(),
             "--channel" => {
                 // 1-based on the command line, matching the labels on an interface's front panel.
@@ -172,7 +175,7 @@ const SWEEP: [(&str, f32); 14] = [
 fn run_synthetic(args: &Args) {
     let sr = 48_000.0f32;
     let window = (WINDOW_MS / 1000.0 * sr).round() as usize;
-    let mut det = Detector::new(sr, window, MIN_HZ, MAX_HZ);
+    let mut det = Detector::new(sr, window, MIN_HZ, MAX_HZ).with_lowpass(args.lowpass);
 
     println!(
         "synthetic accuracy sweep — sr {} Hz, window {window} ({:.1} ms)",
@@ -189,6 +192,9 @@ fn run_synthetic(args: &Args) {
     }
     if let Some(b) = args.inharmonicity {
         println!("stiff-string inharmonicity, B = {b:e}");
+    }
+    if let Some(m) = args.lowpass {
+        println!("low-pass before refinement at {m}x coarse f0");
     }
     if let Some(n) = args.partials {
         println!("partials limited to {n} (equivalent to a low-pass at {n}x f0)");
@@ -274,8 +280,13 @@ fn run_wav(path: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         window as f32 / sr * 1000.0, hop as f32 / sr * 1000.0);
     }
 
-    let mut det = Detector::new(sr, window, MIN_HZ, MAX_HZ);
+    let mut det = Detector::new(sr, window, MIN_HZ, MAX_HZ).with_lowpass(args.lowpass);
     let mut stats = Stats::default();
+    // Gate 18 dB above the tracked floor, never above -50 dBFS, leaking up 0.1 dB/s.
+    // A 1 dB/s leak drifted the floor 12 dB over a 12 s clip -- far faster than any real noise
+    // floor moves, and it dragged the gate up during continuous playing.
+    let mut floor = NoiseFloor::new(18.0, -50.0, 0.1, sr / hop as f32);
+    let (mut passed, mut total) = (0usize, 0usize);
     let mut pos = 0usize;
     while pos + window <= samples.len() {
         let frame = &samples[pos..pos + window];
@@ -299,10 +310,24 @@ fn run_wav(path: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 None => println!("t={t:5.2}  lvl={db:6.1}dB  clar=  --"),
             }
         }
+        floor.observe(db);
+        total += 1;
+        let clarity_ok = r.as_ref().map(|r| r.clarity >= 0.90).unwrap_or(false);
+        if db > floor.gate_db() && clarity_ok {
+            passed += 1;
+        }
         stats.push(db, r.as_ref());
         pos += hop;
     }
-    if !args.csv { stats.report(&tag, sr, window, hop); }
+    if !args.csv {
+        stats.report(&tag, sr, window, hop);
+        println!(
+            "\nGATING  observed floor {:.1} dBFS  ->  gate {:.1} dBFS (+18 dB, ceiling -50)\n\
+             \x20       frames passing BOTH gates (level + clarity>=0.90): {}/{} = {:.1}%",
+            floor.floor_db(), floor.gate_db(), passed, total,
+            100.0 * passed as f32 / total.max(1) as f32
+        );
+    }
     Ok(())
 }
 
@@ -418,7 +443,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     stream.play()?;
 
-    let mut det = Detector::new(sample_rate, window, MIN_HZ, MAX_HZ);
+    let mut det = Detector::new(sample_rate, window, MIN_HZ, MAX_HZ).with_lowpass(args.lowpass);
     let det_max_lag = det.refine_max_lag();
     let mut hist: Vec<f32> = Vec::with_capacity(window * 4);
     let mut recorded: Vec<f32> = Vec::new();

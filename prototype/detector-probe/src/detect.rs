@@ -68,6 +68,10 @@ pub struct Detector {
     acf: Vec<f32>,
     prefix_sq: Vec<f32>,
     nsdf: Vec<f32>,
+    /// |X|² kept aside, so the low-pass pass can re-use it without a second forward FFT.
+    power: Vec<f32>,
+    nsdf_lp: Vec<f32>,
+    lowpass_mult: Option<f32>,
 }
 
 impl Detector {
@@ -101,7 +105,19 @@ impl Detector {
             acf: vec![0.0; fft_len],
             prefix_sq: vec![0.0; window + 1],
             nsdf: vec![0.0; window],
+            power: vec![0.0; fft_len / 2 + 1],
+            nsdf_lp: vec![0.0; window],
+            lowpass_mult: None,
         }
+    }
+
+    /// Low-pass ahead of refinement, at `mult` × the coarse f0. The coarse pass only needs the
+    /// right octave, so it stays full-band; refinement runs on a band-limited autocorrelation.
+    /// Motivation: inharmonicity error is carried almost entirely by the upper partials, which
+    /// pull the best-fit period sharp. Removing them removes most of the bias.
+    pub fn with_lowpass(mut self, mult: Option<f32>) -> Self {
+        self.lowpass_mult = mult;
+        self
     }
 
     /// The longest lag refinement will look at, in samples — the ceiling on `k · T`.
@@ -125,8 +141,9 @@ impl Detector {
         // exactly what the k-multiple stage needs.
         let fwd = self.planner.plan_fft_forward(self.fft_len);
         fwd.process(&mut self.padded, &mut self.spectrum).ok()?;
-        for c in self.spectrum.iter_mut() {
-            *c = Complex::new(c.norm_sqr(), 0.0);
+        for (p, c) in self.power.iter_mut().zip(self.spectrum.iter_mut()) {
+            *p = c.norm_sqr();
+            *c = Complex::new(*p, 0.0);
         }
         let inv = self.planner.plan_fft_inverse(self.fft_len);
         inv.process(&mut self.spectrum, &mut self.acf).ok()?;
@@ -160,6 +177,46 @@ impl Detector {
         let coarse_hz = self.sample_rate / coarse_lag;
         let clarity = parabolic(&self.nsdf, coarse_lag.round() as usize).1.clamp(0.0, 1.0);
 
+        // Optional band-limited autocorrelation for stage 2 only. ACF of a filtered signal is
+        // IFFT(|H|²·|X|²), so tapering the stored power spectrum gives it without a second
+        // forward transform. The taper is a raised cosine rather than a brick wall, because an
+        // abrupt cut rings and plants sidelobes right where we are about to look for peaks.
+        let refine_on_lp = match self.lowpass_mult {
+            Some(mult) => {
+                let cutoff_hz = coarse_hz * mult;
+                let bin_hz = self.sample_rate / self.fft_len as f32;
+                let cut = cutoff_hz / bin_hz;
+                let start = cut * 0.85;
+                for (i, c) in self.spectrum.iter_mut().enumerate() {
+                    let f = i as f32;
+                    let h = if f <= start {
+                        1.0
+                    } else if f >= cut {
+                        0.0
+                    } else {
+                        0.5 * (1.0 + (std::f32::consts::PI * (f - start) / (cut - start)).cos())
+                    };
+                    *c = Complex::new(self.power[i] * h * h, 0.0);
+                }
+                let inv = self.planner.plan_fft_inverse(self.fft_len);
+                inv.process(&mut self.spectrum, &mut self.acf).ok()?;
+                let z = self.acf[0];
+                if z <= f32::EPSILON {
+                    return None;
+                }
+                // Normalised without prefix sums: for a stationary signal m(τ) is proportional
+                // to the overlap (1 − τ/N), so dividing that out approximates the NSDF closely
+                // enough to locate peaks, which is all stage 2 needs from it.
+                for t in 0..self.window {
+                    let overlap = 1.0 - t as f32 / self.window as f32;
+                    self.nsdf_lp[t] = if overlap > 1e-3 { self.acf[t] / (z * overlap) } else { 0.0 };
+                }
+                true
+            }
+            None => false,
+        };
+        let probe_curve: &[f32] = if refine_on_lp { &self.nsdf_lp } else { &self.nsdf };
+
         // Stage 2. Probe every k, including well past the provisional cap, and record what
         // happens rather than stopping at the first success.
         let k_max_window = ((self.refine_max_lag as f32 / coarse_lag).floor() as usize)
@@ -176,11 +233,11 @@ impl Detector {
             }
             let mut best = lo;
             for t in lo..=hi {
-                if self.nsdf[t] > self.nsdf[best] {
+                if probe_curve[t] > probe_curve[best] {
                     best = t;
                 }
             }
-            let (peak_lag, peak_val) = parabolic(&self.nsdf, best);
+            let (peak_lag, peak_val) = parabolic(probe_curve, best);
             let implied_hz = self.sample_rate / (peak_lag / k as f32);
             let cents = 1200.0 * (implied_hz / coarse_hz).log2();
             probes.push(KProbe {
@@ -282,4 +339,57 @@ pub fn nearest_note(hz: f32) -> (String, f32) {
     let n = nearest as i32;
     let name = format!("{}{}", NAMES[(n.rem_euclid(12)) as usize], n / 12 - 1);
     (name, cents)
+}
+
+/// Tracks the noise floor so the Level gate adapts to the rig instead of hard-coding a dBFS
+/// number. A fixed floor cannot work: the measured floor was -78 dBFS on one interface at one
+/// gain setting, and turning the gain knob slides the whole distribution.
+///
+/// A running minimum over the whole session, not a sliding window and not an average:
+///
+/// - An **average** is dragged upward by loud passages. Play continuously and an EMA-based floor
+///   climbs until it gates off the notes it exists to pass.
+/// - A **sliding window** has the same flaw over its own length. Measured: a 10 s window during
+///   continuous playing tracked the playing level (-27.9 dBFS), not the noise floor.
+///
+/// A noise floor is a property of the rig and gain setting, so it barely changes within a session.
+/// The minimum captures it from the first quiet moment and is immune to loud passages by
+/// construction, with a slow upward leak in case the environment genuinely gets noisier.
+///
+/// `ceiling_db` is not merely a safety net — it is co-equal to the tracking. If the app starts
+/// while the player is already playing there is no quiet frame to learn from, and the ceiling is
+/// the only thing keeping the app from being deaf until one arrives.
+pub struct NoiseFloor {
+    floor_db: Option<f32>,
+    margin_db: f32,
+    ceiling_db: f32,
+    leak_db_per_frame: f32,
+}
+
+impl NoiseFloor {
+    pub fn new(margin_db: f32, ceiling_db: f32, leak_db_per_sec: f32, fps: f32) -> Self {
+        Self {
+            floor_db: None,
+            margin_db,
+            ceiling_db,
+            leak_db_per_frame: leak_db_per_sec / fps.max(1.0),
+        }
+    }
+
+    pub fn observe(&mut self, db: f32) {
+        self.floor_db = Some(match self.floor_db {
+            None => db,
+            Some(f) if db < f => db,
+            Some(f) => f + self.leak_db_per_frame,
+        });
+    }
+
+    pub fn floor_db(&self) -> f32 {
+        self.floor_db.unwrap_or(-120.0)
+    }
+
+    /// The level a frame must exceed to be considered signal.
+    pub fn gate_db(&self) -> f32 {
+        (self.floor_db() + self.margin_db).min(self.ceiling_db)
+    }
 }

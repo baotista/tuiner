@@ -154,7 +154,64 @@ _39 ^74 _45 ^52 _61 ^57 _55 ^42 _69 ^13     ( _ = E1, ^ = E2, one char per frame
 MPM's "first peak within 90% of the tallest" rule is doing its job. Picking the tallest peak outright
 is what produces octave errors, and this is the evidence that the distinction matters in practice.
 
-## 7. Still open
+## 7. Low-pass before refinement — measured, adopted
+
+Refinement now runs on a band-limited autocorrelation, low-passed at 8x the coarse f0 with a
+raised-cosine taper (a brick wall rings and plants sidelobes exactly where we then look for peaks).
+Costs one extra inverse FFT and no extra forward transform, because the ACF of a filtered signal is
+`IFFT(|H|^2 . |X|^2)` and the power spectrum is already stored.
+
+At B = 5e-5, refined error:
+
+| note | no low-pass | low-pass 8x |
+|---|---|---|
+| B0 | +3.12c | -0.69c |
+| E1 | +2.04c | +0.07c |
+| E2 | +2.21c | +0.63c |
+| G3 | +1.37c | +0.76c |
+| A4 | +0.40c | +0.72c (worse) |
+| **worst** | **3.12c** | **0.95c** |
+
+Worst case crosses under the 1c requirement. Low notes gain most, having the most partials; a couple
+of high notes lose slightly. Strictly periodic signals are unchanged at 0.01c, so it costs nothing
+where there is no inharmonicity to correct.
+
+Caveat: at B = 2e-4 the benefit largely vanishes. But a uniform B across the range is unphysical --
+thick wound bass strings have low B, thin plain steel has high B -- so that case does not correspond
+to a real instrument.
+
+## 8. Adaptive Level gate — measured, adopted
+
+A fixed dBFS floor cannot work: the floor measured -78 dBFS on this rig at this gain, and the gain
+knob slides the whole distribution. Two simpler designs were tried and rejected **on measurement**:
+
+- **Averaging / EMA** — dragged upward by loud passages until it gates off the notes it exists to pass.
+- **Sliding-window minimum** — same flaw over the window length. A 10 s window during continuous
+  playing tracked the *playing* level (-27.9 dBFS), not the noise floor. Three of four clips ended up
+  gated by the safety ceiling rather than by any tracking.
+
+Adopted: **session-wide running minimum, +18 dB margin, ceiling -50 dBFS, upward leak 0.1 dB/s.** A
+noise floor is a property of the rig and gain, so it barely moves within a session; a minimum captures
+it at the first quiet moment and is immune to loud passages by construction. The leak handles a
+genuinely noisier environment -- at 1 dB/s it drifted 12 dB across a 12 s clip, far faster than any real
+floor moves, hence 0.1.
+
+The ceiling is **co-equal to the tracking, not a safety net**: if the app starts while the player is
+already playing, there is no quiet frame to learn from, and the ceiling is the only thing preventing
+deafness until one arrives.
+
+| clip | tracked floor | gate | passes both gates |
+|---|---|---|---|
+| hum | -78.9 dBFS | -60.9 (adaptive) | **0.0%** |
+| bass low E | -49.1 | -50.0 (ceiling) | 89.9% |
+| guitar top E | -67.3 | -50.0 (ceiling) | 86.3% |
+| chord | -75.3 | -57.3 (adaptive) | 4.1% |
+
+Loosening the ceiling from -40 to -50 recovered guitar frames (80.3% -> 86.3%) but raised chord
+admission from 2.7% to 4.1% -- i.e. the Level gate stops helping against chords and Clarity carries it
+alone. Accepted, since those frames arrive isolated and median-3 removes them.
+
+## 9. Still open
 
 - **The hum clip is unusable.** `hum.wav` is digital silence: 99.85% of samples are exactly zero, peak
   1 LSB, −118 dBFS RMS. The input was dead — nothing connected, or the wrong channel. It establishes a
