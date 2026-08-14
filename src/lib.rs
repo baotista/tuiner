@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod detect;
 pub mod gate;
+pub mod picker;
 pub mod pipeline;
 pub mod pitch;
 pub mod smoothing;

@@ -60,6 +60,17 @@ pub fn level_db(samples: &[f32]) -> f32 {
     }
 }
 
+/// Fast attack, slow release toward a new Level reading: a jump is shown immediately, a drop
+/// fades out over a few callbacks, so a brief pluck stays visible in a meter a moment after it
+/// happened. Used by the Input Device / Input Channel picker's live per-channel meter.
+pub fn ease_level(prev: f32, target: f32) -> f32 {
+    if !prev.is_finite() || target > prev {
+        target
+    } else {
+        prev + (target - prev) * 0.3
+    }
+}
+
 /// Tracks the noise floor so the Level gate adapts to the rig instead of hard-coding a dBFS
 /// number. A fixed floor cannot work: the measured floor was -78 dBFS on one interface at one
 /// gain setting, and turning the gain knob slides the whole distribution.
@@ -153,6 +164,25 @@ mod tests {
             "a sustained loud passage dragged the tracked floor up to {:.1} dBFS",
             f.floor_db()
         );
+    }
+
+    #[test]
+    fn ease_level_jumps_up_immediately() {
+        assert_eq!(ease_level(-60.0, -20.0), -20.0);
+    }
+
+    #[test]
+    fn ease_level_decays_gradually_rather_than_snapping_to_the_floor() {
+        let eased = ease_level(-20.0, -80.0);
+        assert!(
+            eased > -80.0 && eased < -20.0,
+            "expected a partial decay, got {eased}"
+        );
+    }
+
+    #[test]
+    fn ease_level_from_the_initial_negative_infinity_takes_the_target_directly() {
+        assert_eq!(ease_level(f32::NEG_INFINITY, -40.0), -40.0);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::picker::{DeviceEntry, Step};
 use crate::pitch::IN_TUNE_TOLERANCE_CENTS;
 
 /// How far the coarse bar reaches in either direction. The Strobe, not this bar, carries fine
@@ -111,6 +112,105 @@ fn bar_line(cents: f32, width: usize, style: Style) -> Line<'static> {
         });
     }
     Line::from(Span::styled(s, style))
+}
+
+/// What the Input Device / Input Channel picker should show, independent of `cpal` and the
+/// `Picker` reducer's own bookkeeping — a pure view-model, same reasoning as `Readout`.
+pub struct PickerView<'a> {
+    pub devices: &'a [DeviceEntry],
+    pub step: Step,
+    pub device_idx: usize,
+    pub channel_idx: usize,
+    /// Live Level, in dBFS, one entry per channel of the currently highlighted Input Device —
+    /// what makes it obvious which jack the instrument is actually in.
+    pub levels_db: &'a [f32],
+    /// The explanation banner shown when the picker was reopened rather than opened fresh —
+    /// a mid-session `i` keypress carries none, a vanished remembered Input Device carries one.
+    pub message: Option<&'a str>,
+}
+
+/// The bottom of the Level meter's displayed range, in dBFS — quieter than this shows as an
+/// empty bar rather than trying to resolve dB differences that don't move it.
+const METER_FLOOR_DB: f32 = -60.0;
+
+pub fn render_picker(frame: &mut Frame, area: Rect, view: &PickerView) {
+    let title = match view.step {
+        Step::Device => " Tuiner — choose an Input Device ",
+        Step::Channel => " Tuiner — choose an Input Channel ",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    if let Some(message) = view.message {
+        lines.push(Line::from(Span::styled(
+            message.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+    }
+
+    match view.step {
+        Step::Device => {
+            for (i, device) in view.devices.iter().enumerate() {
+                lines.push(picker_row(
+                    i == view.device_idx,
+                    format!(
+                        "{} ({} channel{})",
+                        device.name,
+                        device.channels,
+                        plural(device.channels)
+                    ),
+                ));
+            }
+        }
+        Step::Channel => {
+            let device = &view.devices[view.device_idx];
+            for c in 0..device.channels as usize {
+                let db = view.levels_db.get(c).copied().unwrap_or(f32::NEG_INFINITY);
+                let label = format!("Channel {}  {}", c + 1, level_bar(db, 20));
+                lines.push(picker_row(c == view.channel_idx, label));
+            }
+        }
+    }
+
+    lines.push(Line::default());
+    let hint = match view.step {
+        Step::Device => "↑/↓ choose · Enter select · Esc back · q quit",
+        Step::Channel => "↑/↓ choose · Enter confirm · Esc back",
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn plural(channels: u16) -> &'static str {
+    if channels == 1 { "" } else { "s" }
+}
+
+fn picker_row(highlighted: bool, label: String) -> Line<'static> {
+    let marker = if highlighted { "> " } else { "  " };
+    let style = if highlighted {
+        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(format!("{marker}{label}"), style))
+}
+
+/// A block-character Level bar, `width` cells wide, filled in proportion to how far `db` sits
+/// between [`METER_FLOOR_DB`] and 0 dBFS — the range the picker's meter cares about.
+fn level_bar(db: f32, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let ratio = ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0);
+    let filled = (ratio * width as f32).round() as usize;
+    "█".repeat(filled) + &"·".repeat(width - filled)
 }
 
 #[cfg(test)]
@@ -248,5 +348,102 @@ mod tests {
         let buf = render_to_buffer(&Readout::Listening, 60, 6);
         let text = buffer_text(&buf);
         assert!(text.contains("listening"));
+    }
+
+    fn render_picker_to_buffer(view: &PickerView, width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_picker(f, f.area(), view)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn devices() -> Vec<DeviceEntry> {
+        vec![
+            DeviceEntry {
+                name: "Built-in Microphone".into(),
+                channels: 1,
+            },
+            DeviceEntry {
+                name: "USB Audio Interface".into(),
+                channels: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn device_step_lists_every_device_with_its_channel_count() {
+        let devices = devices();
+        let view = PickerView {
+            devices: &devices,
+            step: Step::Device,
+            device_idx: 0,
+            channel_idx: 0,
+            levels_db: &[],
+            message: None,
+        };
+        let text = buffer_text(&render_picker_to_buffer(&view, 60, 10));
+        assert!(text.contains("Built-in Microphone (1 channel)"));
+        assert!(text.contains("USB Audio Interface (2 channels)"));
+    }
+
+    #[test]
+    fn highlighted_device_row_is_marked() {
+        let devices = devices();
+        let view = PickerView {
+            devices: &devices,
+            step: Step::Device,
+            device_idx: 1,
+            channel_idx: 0,
+            levels_db: &[],
+            message: None,
+        };
+        let text = buffer_text(&render_picker_to_buffer(&view, 60, 10));
+        let highlighted_line = text
+            .lines()
+            .find(|l| l.contains("USB Audio Interface"))
+            .unwrap();
+        assert!(highlighted_line.contains("> USB Audio Interface"));
+    }
+
+    #[test]
+    fn channel_step_lists_one_row_per_channel_with_a_level_meter() {
+        let devices = devices();
+        let view = PickerView {
+            devices: &devices,
+            step: Step::Channel,
+            device_idx: 1,
+            channel_idx: 0,
+            levels_db: &[-10.0, -60.0],
+            message: None,
+        };
+        let text = buffer_text(&render_picker_to_buffer(&view, 60, 10));
+        assert!(text.contains("Channel 1"));
+        assert!(text.contains("Channel 2"));
+        // The louder channel's meter must show more filled cells than the quiet one.
+        let line1 = text.lines().find(|l| l.contains("Channel 1")).unwrap();
+        let line2 = text.lines().find(|l| l.contains("Channel 2")).unwrap();
+        assert!(line1.matches('█').count() > line2.matches('█').count());
+    }
+
+    #[test]
+    fn reopen_message_is_shown_as_a_banner() {
+        let devices = devices();
+        let view = PickerView {
+            devices: &devices,
+            step: Step::Device,
+            device_idx: 0,
+            channel_idx: 0,
+            levels_db: &[],
+            message: Some("Input Device disappeared — pick again"),
+        };
+        let text = buffer_text(&render_picker_to_buffer(&view, 60, 10));
+        assert!(text.contains("Input Device disappeared"));
+    }
+
+    #[test]
+    fn level_bar_is_full_at_0_dbfs_and_empty_at_the_floor() {
+        assert_eq!(level_bar(0.0, 10), "█".repeat(10));
+        assert_eq!(level_bar(METER_FLOOR_DB, 10), "·".repeat(10));
+        assert_eq!(level_bar(-120.0, 10), "·".repeat(10));
     }
 }
