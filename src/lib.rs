@@ -1,6 +1,8 @@
 pub mod audio;
 pub mod detect;
+pub mod gate;
 pub mod pipeline;
+pub mod smoothing;
 
 /// Analysis window, sized in milliseconds rather than samples so 44.1 kHz and 48 kHz devices
 /// need no special-casing — each just converts at its own reported rate.

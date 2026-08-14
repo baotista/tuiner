@@ -3,7 +3,8 @@
 
 use rtrb::RingBuffer;
 use tuiner::audio::{AudioSource, LiveCapture};
-use tuiner::{detect, pipeline, window_samples};
+use tuiner::pipeline::{self, Frame};
+use tuiner::{detect, window_samples};
 
 fn main() {
     let source = LiveCapture::default_device().expect("no default Input Device available");
@@ -14,11 +15,18 @@ fn main() {
     let _handle = Box::new(source).start(producer);
 
     println!("listening at {sample_rate} Hz — Ctrl+C to quit");
-    pipeline::run(consumer, sample_rate, |reading| {
-        let (note, cents) = detect::nearest_note(reading.refined_hz);
-        println!(
-            "{note:<4} {cents:>+6.1}c  {:>8.2} Hz  clarity {:.2}",
-            reading.refined_hz, reading.clarity
-        );
+    pipeline::run(consumer, sample_rate, |frame| match frame {
+        Frame::Pitched { hz, clarity, .. } => {
+            let (note, cents) = detect::nearest_note(hz);
+            println!("{note:<4} {cents:>+6.1}c  {hz:>8.2} Hz  clarity {clarity:.2}");
+        }
+        Frame::Unpitched => println!("listening..."),
+        Frame::Silent {
+            held: Some((hz, clarity)),
+        } => {
+            let (note, cents) = detect::nearest_note(hz);
+            println!("\x1b[2m{note:<4} {cents:>+6.1}c  {hz:>8.2} Hz  clarity {clarity:.2}\x1b[0m");
+        }
+        Frame::Silent { held: None } => println!("listening..."),
     });
 }
