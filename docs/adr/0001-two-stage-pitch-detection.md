@@ -73,10 +73,22 @@ testing because they only fire at the extremes of the range:
   4380). Clamping refinement to the coarse ceiling pins every `k` to 1 and makes the whole second stage
   inert while still appearing to run.
 
-Still outstanding, and answerable only with real audio: the Clarity threshold, the Level floor, and the
-real value of `B` for the strings in question. Note that not one of 135 room-noise frames returned "no
-periodicity found" — the detector always finds *something*, so Clarity carries the entire burden of
-rejection.
+Measured on real audio (bass low E, guitar top E, strummed chord; 1112 note frames, 564 chord frames,
+recorded at 44.1 kHz — which incidentally exercised the millisecond-sized window with no special case):
+
+- **Clarity threshold is 0.90, not the provisional 0.8.** At 0.8 nearly a third of chord frames pass; at
+  0.90, 4.1% pass while 91.3% of note frames are kept, and those stragglers arrive isolated so median-3
+  filtering removes them before display.
+- **`k` is never signal-limited on real strings either.** `k_max_signal == k_max_window` in every level
+  band, and it does not decay — the guitar held k = 42 both above and below −40 dBFS.
+- **Both gates are load-bearing.** Silence below −60 dBFS reaches clarity 0.94, so Clarity cannot reject
+  silence; chords sit at −54..−33 dBFS inside the note range, so Level cannot reject chords.
+- **The Level floor is ~−55 dBFS** for the rig measured, sitting in a genuinely empty histogram valley —
+  but it is gain-dependent and does not transfer between rigs, so fixed-versus-adaptive is still open.
+
+Still outstanding: mains hum was never actually captured (the clip recorded digital silence — 99.85%
+exact zeros), so the rejection case that fires when the player is *not* playing remains untested. The
+real value of `B` for these strings is also unmeasured.
 
 An open recommendation this raised, deliberately left undecided: low-pass ahead of refinement. The
 coarse pass only needs the right octave, so zeroing FFT bins above ~8×f₀ and recomputing would cut the
