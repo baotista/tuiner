@@ -47,6 +47,10 @@ pub enum Readout {
         hz: f32,
         cents: f32,
         dimmed: bool,
+        /// `Some(n)` in Guided Mode when the Pitch matched String `n`'s Capture Range; `None` in
+        /// Chromatic Mode, or in Guided Mode when nothing matched and `note` names the nearest
+        /// Note instead.
+        string_number: Option<u8>,
         /// The Strobe's current phase accumulator reading, in radians — frozen at whatever it
         /// last was while `dimmed`, since nothing is sounding to advance it against.
         strobe_phase: f32,
@@ -56,10 +60,13 @@ pub enum Readout {
     },
 }
 
-pub fn render(frame: &mut Frame, area: Rect, readout: &Readout) {
+/// `mode_label` names the border title, e.g. `"Chromatic"` or `"Guided — Guitar Standard"` —
+/// the only on-screen sign of which Mode and Tuning `Tab`/`t` last landed on, until the
+/// Cockpit's own status area (issue #11) takes that job over.
+pub fn render(frame: &mut Frame, area: Rect, readout: &Readout, mode_label: &str) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Tuiner — Chromatic ");
+        .title(format!(" Tuiner — {mode_label} "));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -72,6 +79,7 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout) {
             hz,
             cents,
             dimmed,
+            string_number,
             strobe_phase,
             trail,
         } => {
@@ -81,8 +89,12 @@ pub fn render(frame: &mut Frame, area: Rect, readout: &Readout) {
                 style = style.add_modifier(Modifier::DIM);
             }
 
+            let label = match string_number {
+                Some(n) => format!("Str {n} {note}"),
+                None => note.clone(),
+            };
             let header = Line::from(vec![
-                Span::styled(format!("{note:<4}"), style),
+                Span::styled(format!("{label:<10}"), style),
                 Span::raw(format!(" {hz:>8.2} Hz   ")),
                 Span::styled(format!("{cents:+.1}c"), style),
                 Span::raw(format!("   {direction}")),
@@ -433,7 +445,9 @@ mod tests {
     fn render_to_buffer(readout: &Readout, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, f.area(), readout)).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), readout, "Chromatic"))
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -455,6 +469,7 @@ mod tests {
             hz: 82.0,
             cents,
             dimmed: false,
+            string_number: None,
             strobe_phase: 0.0,
             trail: Vec::new(),
         }
@@ -665,6 +680,7 @@ mod tests {
             hz: 196.0,
             cents: -0.5,
             dimmed: false,
+            string_number: None,
             strobe_phase,
             trail: Vec::new(),
         }
@@ -791,6 +807,7 @@ mod tests {
             hz: 196.0,
             cents: 0.0,
             dimmed: false,
+            string_number: None,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Gap; 40],
         };
@@ -811,6 +828,7 @@ mod tests {
             hz: 196.0,
             cents: 0.0,
             dimmed: false,
+            string_number: None,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Deviation(-40.0); 40],
         };
@@ -830,6 +848,7 @@ mod tests {
             hz: 196.0,
             cents: 0.0,
             dimmed: false,
+            string_number: None,
             strobe_phase: 0.0,
             trail: vec![TrailSample::Deviation(12.0); 50],
         };
@@ -838,5 +857,46 @@ mod tests {
             assert_eq!(buf.area.width, width);
             assert_eq!(buf.area.height, height);
         }
+    }
+
+    #[test]
+    fn guided_mode_names_the_string_and_its_note_together() {
+        let readout = Readout::Reading {
+            note: "A2".into(),
+            hz: 110.0,
+            cents: 0.0,
+            dimmed: false,
+            string_number: Some(5),
+            strobe_phase: 0.0,
+            trail: Vec::new(),
+        };
+        let text = buffer_text(&render_to_buffer(&readout, 60, 6));
+        assert!(
+            text.contains("Str 5") && text.contains("A2"),
+            "expected both the String number and its Note in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn chromatic_mode_names_only_the_note_with_no_string() {
+        let text = buffer_text(&render_to_buffer(&reading(0.0), 60, 6));
+        assert!(
+            !text.contains("Str "),
+            "expected no String label in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_border_title_names_the_current_mode() {
+        let backend = TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, f.area(), &reading(0.0), "Guided — DADGAD"))
+            .unwrap();
+        let text = buffer_text(&terminal.backend().buffer().clone());
+        assert!(
+            text.contains("Guided — DADGAD"),
+            "expected the Mode/Tuning label in the title, got:\n{text}"
+        );
     }
 }

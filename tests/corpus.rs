@@ -7,7 +7,7 @@ use rtrb::RingBuffer;
 use tuiner::audio::{AudioSource, WavSource};
 use tuiner::detect::Reading;
 use tuiner::pipeline::{Frame, Pipeline};
-use tuiner::{LOWPASS_MULT, MAX_HZ, MIN_HZ, detect, hop_samples, pitch, window_samples};
+use tuiner::{LOWPASS_MULT, MAX_HZ, MIN_HZ, detect, hop_samples, pitch, tuning, window_samples};
 
 fn frames_from_clip(path: &str) -> Vec<Frame> {
     let source = WavSource::open(path).expect("corpus clip must be present");
@@ -130,6 +130,68 @@ fn bass_low_e_produces_a_large_majority_of_pitched_frames_with_no_octave_errors(
             );
         }
     }
+}
+
+/// Issue #8's stronger claim than the no-octave-errors check above: not just that every Pitched
+/// frame reads E1 or E2, but that the clip's alternation actually crosses that boundary about ten
+/// times — the corpus README's own description of the clip, and the specific place an octave
+/// error would surface as a spurious extra crossing or a missed one.
+#[test]
+fn bass_low_e_crosses_the_e1_e2_boundary_about_ten_times() {
+    let frames = frames_from_clip("corpus/bass-low-e.wav");
+    let notes: Vec<String> = frames
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Pitched { hz, .. } => {
+                Some(pitch::nearest_note(*hz, pitch::DEFAULT_REFERENCE_PITCH).0)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!notes.is_empty(), "expected some Pitched frames to track");
+
+    let crossings = notes.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!(
+        (8..=12).contains(&crossings),
+        "expected roughly ten E1/E2 crossings, got {crossings}"
+    );
+}
+
+/// The Chromatic-level check above pins the detector's own octave stability, but issue #8 is
+/// about Guided Mode specifically: every E1 frame must also match Bass Standard's String 4 (E1)
+/// through the real `Tuning::match_pitch` entry point, with no octave confusion introduced by
+/// Capture Range matching itself.
+#[test]
+fn bass_low_e_frames_match_bass_standards_e1_string_through_guided_mode() {
+    let frames = frames_from_clip("corpus/bass-low-e.wav");
+    let bass = tuning::all()
+        .into_iter()
+        .find(|t| t.name == "Bass Standard")
+        .unwrap();
+
+    let mut e1_frames_checked = 0;
+    for frame in &frames {
+        if let Frame::Pitched { hz, .. } = frame {
+            let (note, _cents) = pitch::nearest_note(*hz, pitch::DEFAULT_REFERENCE_PITCH);
+            if note != "E1" {
+                continue;
+            }
+            e1_frames_checked += 1;
+            match bass.match_pitch(*hz) {
+                tuning::Match::String { number, note, .. } => {
+                    assert_eq!(number, 4, "E1 matched String {number} ({note}) instead");
+                    assert_eq!(note, "E1");
+                }
+                tuning::Match::Note { note, .. } => {
+                    panic!("E1 fell back to Note {note} instead of matching String 4")
+                }
+            }
+        }
+    }
+    assert!(
+        e1_frames_checked > 0,
+        "expected some E1 frames to check Guided Mode matching against"
+    );
 }
 
 /// Regression: `frames_from_clip`'s octave check above only ever sees the median-3-smoothed

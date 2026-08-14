@@ -32,7 +32,7 @@ use tuiner::pipeline::{Frame, Pipeline, Polled};
 use tuiner::strobe::Strobe;
 use tuiner::trail::{Trail, TrailSample};
 use tuiner::ui::{self, PickerView, Readout};
-use tuiner::{pitch, trail_capacity, window_samples};
+use tuiner::{pitch, trail_capacity, tuning, window_samples};
 
 fn main() {
     let startup_devices = list_input_devices();
@@ -260,6 +260,14 @@ enum TuningExit {
     DeviceLost,
 }
 
+/// Whether the app is naming bare Notes or matching against a chosen Tuning's Strings — toggled
+/// with `Tab`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Chromatic,
+    Guided,
+}
+
 fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit {
     let sample_rate = source.sample_rate();
     let window = window_samples(sample_rate);
@@ -276,6 +284,10 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     let mut last_pitched: Option<Instant> = None;
     let mut trail = Trail::new(trail_capacity());
 
+    let tunings = tuning::all();
+    let mut mode = Mode::Chromatic;
+    let mut tuning_idx = 0usize;
+
     let mut readout = Readout::Listening;
     loop {
         if handle.disconnected() {
@@ -289,6 +301,13 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return TuningExit::Quit,
                 KeyCode::Char('i') => return TuningExit::ReopenPicker,
+                KeyCode::Tab => {
+                    mode = match mode {
+                        Mode::Chromatic => Mode::Guided,
+                        Mode::Guided => Mode::Chromatic,
+                    }
+                }
+                KeyCode::Char('t') => tuning_idx = (tuning_idx + 1) % tunings.len(),
                 _ => {}
             }
         }
@@ -296,8 +315,10 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
         match pipeline.poll() {
             Polled::Frame(frame) => {
                 let live = matches!(frame, Frame::Pitched { .. });
-                readout = match note_reading(frame) {
-                    Some((note, hz, cents, dimmed)) => {
+                readout = match hz_reading(frame) {
+                    Some((hz, dimmed)) => {
+                        let (note, cents, string_number) =
+                            name_pitch(mode, &tunings[tuning_idx], hz);
                         if live {
                             trail.push(TrailSample::Deviation(cents));
                             let target = pitch::target_hz(hz, cents);
@@ -317,6 +338,7 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                             hz,
                             cents,
                             dimmed,
+                            string_number,
                             strobe_phase: strobe.phase(),
                             trail: trail.padded_samples(),
                         }
@@ -332,25 +354,53 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
             Polled::Pending => {}
         }
 
+        let label = mode_label(mode, tunings[tuning_idx].name);
         terminal
-            .draw(|f| ui::render(f, f.area(), &readout))
+            .draw(|f| ui::render(f, f.area(), &readout, &label))
             .expect("failed to draw frame");
     }
 }
 
-/// The note/hz/cents/dimmed a `Frame` reads as, or `None` when there's nothing to show at all
-/// (`Unpitched`, or `Silent` with no held reading yet).
-fn note_reading(frame: Frame) -> Option<(String, f32, f32, bool)> {
-    let (hz, dimmed) = match frame {
-        Frame::Pitched { hz, .. } => (hz, false),
-        Frame::Unpitched => return None,
+/// What `Tab`/`t` last landed on, for the border title — the only on-screen sign of the current
+/// Mode and Tuning until the Cockpit's status area (issue #11) takes that job over.
+fn mode_label(mode: Mode, tuning_name: &str) -> String {
+    match mode {
+        Mode::Chromatic => "Chromatic".to_string(),
+        Mode::Guided => format!("Guided — {tuning_name}"),
+    }
+}
+
+/// The hz/dimmed a `Frame` reads as, or `None` when there's nothing to show at all (`Unpitched`,
+/// or `Silent` with no held reading yet).
+fn hz_reading(frame: Frame) -> Option<(f32, bool)> {
+    match frame {
+        Frame::Pitched { hz, .. } => Some((hz, false)),
+        Frame::Unpitched => None,
         Frame::Silent {
             held: Some((hz, _clarity)),
-        } => (hz, true),
-        Frame::Silent { held: None } => return None,
-    };
-    let (note, cents) = pitch::nearest_note(hz, pitch::DEFAULT_REFERENCE_PITCH);
-    Some((note, hz, cents, dimmed))
+        } => Some((hz, true)),
+        Frame::Silent { held: None } => None,
+    }
+}
+
+/// Names `hz` per the current Mode: a bare Note in Chromatic Mode, or a String within
+/// `tuning`'s Capture Range (falling back to the nearest Note when nothing matches) in Guided
+/// Mode.
+fn name_pitch(mode: Mode, tuning: &tuning::Tuning, hz: f32) -> (String, f32, Option<u8>) {
+    match mode {
+        Mode::Chromatic => {
+            let (note, cents) = pitch::nearest_note(hz, pitch::DEFAULT_REFERENCE_PITCH);
+            (note, cents, None)
+        }
+        Mode::Guided => match tuning.match_pitch(hz) {
+            tuning::Match::String {
+                number,
+                note,
+                cents,
+            } => (note, cents, Some(number)),
+            tuning::Match::Note { note, cents } => (note, cents, None),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -362,6 +412,16 @@ mod tests {
             .map(|s| s.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn chromatic_mode_label_names_no_tuning() {
+        assert_eq!(mode_label(Mode::Chromatic, "DADGAD"), "Chromatic");
+    }
+
+    #[test]
+    fn guided_mode_label_names_the_current_tuning() {
+        assert_eq!(mode_label(Mode::Guided, "DADGAD"), "Guided — DADGAD");
     }
 
     #[test]

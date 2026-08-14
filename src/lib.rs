@@ -7,6 +7,7 @@ pub mod pitch;
 pub mod smoothing;
 pub mod strobe;
 pub mod trail;
+pub mod tuning;
 pub mod ui;
 
 /// Analysis window, sized in milliseconds rather than samples so 44.1 kHz and 48 kHz devices

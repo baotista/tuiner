@@ -19,15 +19,27 @@ pub fn nearest_note(hz: f32, reference_pitch: f32) -> (String, f32) {
     let midi = 69.0 + 12.0 * (hz / reference_pitch).log2();
     let nearest = midi.round();
     let cents = (midi - nearest) * 100.0;
-    let n = nearest as i32;
+    (note_name(nearest as i32), cents)
+}
+
+/// The Note name for a MIDI note number (e.g. `69` -> "A4"). Exists alongside [`nearest_note`]
+/// so a Tuning's fixed Target Pitches can be labelled from the same numbering, rather than a
+/// hand-typed name risking disagreement with the Hz [`midi_to_hz`] computes for it.
+pub fn note_name(midi: i32) -> String {
     // div_euclid, not `/`: plain integer division truncates toward zero, which is off by one
     // octave for any negative MIDI number (Rust's `/` gives -3/12 == 0, not the floor -1).
-    let name = format!(
+    format!(
         "{}{}",
-        NAMES[(n.rem_euclid(12)) as usize],
-        n.div_euclid(12) - 1
-    );
-    (name, cents)
+        NAMES[(midi.rem_euclid(12)) as usize],
+        midi.div_euclid(12) - 1
+    )
+}
+
+/// The frequency of a MIDI note number at the given Reference Pitch — the inverse of the pitch
+/// half of [`nearest_note`]. A Tuning's Target Pitches are derived from this, not hand-typed, so
+/// they can never drift from the equal-temperament relationship the rest of the app assumes.
+pub fn midi_to_hz(midi: i32, reference_pitch: f32) -> f32 {
+    reference_pitch * 2f32.powf((midi - 69) as f32 / 12.0)
 }
 
 /// The Target Pitch a detected `hz` is `cents` away from — the inverse of the Deviation half of
@@ -51,6 +63,20 @@ mod tests {
             roundtrip_cents.abs() < 0.01,
             "expected the Target Pitch to read as ~0 Deviation from itself, got {roundtrip_cents}"
         );
+    }
+
+    #[test]
+    fn midi_to_hz_and_note_name_round_trip_through_nearest_note() {
+        // A4 is midi 69 by definition — the anchor the whole conversion is built from.
+        assert_eq!(note_name(69), "A4");
+        assert!((midi_to_hz(69, DEFAULT_REFERENCE_PITCH) - 440.0).abs() < 0.01);
+
+        for midi in [28, 40, 55, 62, 69, 76] {
+            let hz = midi_to_hz(midi, DEFAULT_REFERENCE_PITCH);
+            let (note, cents) = nearest_note(hz, DEFAULT_REFERENCE_PITCH);
+            assert_eq!(note, note_name(midi));
+            assert!(cents.abs() < 0.01, "expected ~0c for {note}, got {cents}");
+        }
     }
 
     #[test]
