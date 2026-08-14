@@ -93,7 +93,7 @@ the range where casual testing never looks:
 
 ## 6. Real-audio phase — constants pinned
 
-Measured over four clips recorded at 44.1 kHz (`corpus-scratch-PROTOTYPE/`): a bass low E, a guitar
+Measured over four clips recorded at 44.1 kHz (`corpus/`): a bass low E, a guitar
 top E, a strummed chord, and an intended hum clip. 1112 note frames, 564 chord frames.
 
 Note the sample rate: the device ran at **44.1 kHz, not 48 kHz**, giving a 7541-sample window rather

@@ -37,6 +37,7 @@ cargo run -- --list                # then plug something in
 | `--inharmonicity <B>` | stiff-string: partial `h` at `h·f₀·√(1+Bh²)`. Try `5e-5` |
 | `--partials <n>` | cap partial count — equivalent to a low-pass at `n×f₀` |
 | `--k-table` | per-`k` detail: NSDF height, implied Hz, whether the peak was found |
+| `--lowpass <n>` | low-pass before refinement at `n`x the coarse f0. Adopted at `8` |
 
 ### Real audio — real timbre, so robustness is assertable
 
@@ -47,6 +48,8 @@ cargo run -- --list                # then plug something in
 | `--tag <label>` | labels the run; one run per condition keeps segments clean |
 | `--secs <n>` | run length, default 20 |
 | `--record <name>` | writes `corpus-scratch-PROTOTYPE/<name>.wav` (mono 16-bit) |
+| `--wav-in <path>` | analyse a recorded clip instead of live audio |
+| `--csv` | per-frame values to stdout for offline analysis |
 
 Run one session per condition rather than tagging interactively — clean segments, no mis-tagging:
 
@@ -61,4 +64,6 @@ Each run ends with percentile summaries of Level, Clarity and `k_max`, plus a br
 by level bucket — that last table is how you see whether `k` degrades as a note decays.
 
 `--record` also makes this the tool that captures the test corpus. `corpus-scratch-PROTOTYPE/` is
-scratch — wipe it freely; it is gitignored.
+scratch — wipe it freely; it is gitignored. Promote a clip into [`corpus/`](corpus/README.md) once it
+proves worth keeping; those are tracked, and re-running against them is how the constants stay
+reproducible instead of resting on someone's memory of a session.
