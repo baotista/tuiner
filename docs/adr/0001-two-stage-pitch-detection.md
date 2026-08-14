@@ -86,14 +86,28 @@ recorded at 44.1 kHz — which incidentally exercised the millisecond-sized wind
   with no flapping at the boundary.
 - **Both gates are load-bearing.** Silence below −60 dBFS reaches clarity 0.94, so Clarity cannot reject
   silence; chords sit at −54..−33 dBFS inside the note range, so Level cannot reject chords.
-- **The Level floor is ~−55 dBFS** for the rig measured, sitting in a genuinely empty histogram valley —
-  but it is gain-dependent and does not transfer between rigs, so fixed-versus-adaptive is still open.
+- **The Level floor is gain-dependent** and cannot be a constant — see ADR 0005.
 
-Still outstanding: mains hum was never actually captured (the clip recorded digital silence — 99.85%
-exact zeros), so the rejection case that fires when the player is *not* playing remains untested. The
-real value of `B` for these strings is also unmeasured.
+A re-recorded noise clip (guitar plugged in, not played — the true "not playing" state) settled the last
+of it: that noise reads as **clarity 0.75–0.83, median exactly 0.80**, so the original provisional
+threshold sat in the middle of the noise distribution and would have admitted about half of those
+frames. At 0.90 it is rejected entirely. Note also what the noise is *reported as* — 51.82 Hz, G#1 −3¢,
+an entirely plausible-looking nearly-in-tune note. That is the whole case for gating: the detector never
+declines to name a pitch, it just names a wrong one convincingly.
 
-An open recommendation this raised, deliberately left undecided: low-pass ahead of refinement. The
-coarse pass only needs the right octave, so zeroing FFT bins above ~8×f₀ and recomputing would cut the
-inharmonicity bias substantially — corroborated by damping upper partials taking worst refined error
-from 3.12¢ to 0.61¢ — at almost no cost, since the spectrum is already in hand.
+Still unmeasured: the real value of `B` for these strings.
+
+## Low-pass before refinement — adopted
+
+The coarse pass stays full-band, since it only needs the right octave. Refinement runs on an
+autocorrelation low-passed at 8×f₀ with a raised-cosine taper — a brick wall rings and plants sidelobes
+exactly where stage 2 then looks for peaks. It costs one extra inverse FFT and no extra forward one,
+because the ACF of a filtered signal is `IFFT(|H|²·|X|²)` and the power spectrum is already stored.
+
+Measured at B = 5e-5, worst refined error across the sweep falls from **3.12¢ to 0.95¢**, crossing under
+the requirement. Low notes gain most, having the most partials (B0: +3.12¢ → −0.69¢); a couple of high
+notes lose slightly (A4: +0.40¢ → +0.72¢). Strictly periodic signals are unchanged at 0.01¢, so it costs
+nothing where there is no inharmonicity to correct.
+
+The benefit largely vanishes at B = 2e-4, but a uniform B across the whole range is unphysical: thick
+wound bass strings have low B and thin plain steel has high B, so that case is not a real instrument.
