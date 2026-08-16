@@ -431,15 +431,15 @@ fn run_tuning(
                         string_lock =
                             toggle_string_lock(&tunings[state.tuning_idx], string_lock, n);
                     }
-                    KeyCode::Char('+') => {
+                    KeyCode::Char(c @ ('+' | '-')) => {
+                        let delta = if c == '+' { 1.0 } else { -1.0 };
                         state.reference_pitch =
-                            pitch::clamp_reference_pitch(state.reference_pitch + 1.0);
+                            pitch::clamp_reference_pitch(state.reference_pitch + delta);
                         tunings = tuning::all(state.reference_pitch);
-                    }
-                    KeyCode::Char('-') => {
-                        state.reference_pitch =
-                            pitch::clamp_reference_pitch(state.reference_pitch - 1.0);
-                        tunings = tuning::all(state.reference_pitch);
+                        // Every Target Pitch just moved, exactly like a Tuning change — a String
+                        // marked InTune against the old Target Pitch would otherwise keep showing
+                        // a stale checkmark on the Headstock after Reference Pitch shifted it.
+                        reached_in_tune.clear();
                     }
                     _ => {}
                 }
