@@ -299,6 +299,10 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     // by String number rather than indexed by position, so nothing here assumes numbers are
     // contiguous from 1 — that's `tuning::build()`'s invariant to keep, not this loop's to lean on.
     let mut reached_in_tune: HashSet<u8> = HashSet::new();
+    // The keymap recap overlay (issue #13), toggled by `?`. Purely a rendering concern — nothing
+    // else in this loop reads it, so the pipeline keeps polling and the readout keeps updating
+    // underneath while it's shown, and dismissing it reveals a live reading, not a stale one.
+    let mut show_keymap = false;
 
     let mut readout = Readout::Listening {
         locked: None,
@@ -313,25 +317,29 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
             && let Ok(Event::Key(key)) = event::read()
             && key.kind == KeyEventKind::Press
         {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return TuningExit::Quit,
-                KeyCode::Char('i') => return TuningExit::ReopenPicker,
-                KeyCode::Tab => {
-                    mode = match mode {
-                        Mode::Chromatic => Mode::Guided,
-                        Mode::Guided => Mode::Chromatic,
+            let consumed;
+            (show_keymap, consumed) = keymap_overlay_update(show_keymap, key.code);
+            if !consumed {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return TuningExit::Quit,
+                    KeyCode::Char('i') => return TuningExit::ReopenPicker,
+                    KeyCode::Tab => {
+                        mode = match mode {
+                            Mode::Chromatic => Mode::Guided,
+                            Mode::Guided => Mode::Chromatic,
+                        }
                     }
+                    KeyCode::Char('t') => {
+                        tuning_idx = (tuning_idx + 1) % tunings.len();
+                        string_lock = None;
+                        reached_in_tune.clear();
+                    }
+                    KeyCode::Char(c @ '1'..='6') if mode == Mode::Guided => {
+                        let n = c.to_digit(10).expect("guarded by '1'..='6'") as u8;
+                        string_lock = toggle_string_lock(&tunings[tuning_idx], string_lock, n);
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('t') => {
-                    tuning_idx = (tuning_idx + 1) % tunings.len();
-                    string_lock = None;
-                    reached_in_tune.clear();
-                }
-                KeyCode::Char(c @ '1'..='6') if mode == Mode::Guided => {
-                    let n = c.to_digit(10).expect("guarded by '1'..='6'") as u8;
-                    string_lock = toggle_string_lock(&tunings[tuning_idx], string_lock, n);
-                }
-                _ => {}
             }
         }
 
@@ -400,7 +408,12 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
 
         let label = mode_label(mode, tunings[tuning_idx].name);
         terminal
-            .draw(|f| ui::render(f, f.area(), &readout, &label))
+            .draw(|f| {
+                ui::render(f, f.area(), &readout, &label);
+                if show_keymap {
+                    ui::render_keymap_overlay(f, f.area());
+                }
+            })
             .expect("failed to draw frame");
     }
 }
@@ -562,6 +575,20 @@ fn toggle_string_lock(tuning: &tuning::Tuning, current: Option<u8>, n: u8) -> Op
     if current == Some(n) { None } else { Some(n) }
 }
 
+/// The keymap recap overlay's (issue #13) next `show_keymap` state after `key`, and whether the
+/// key was consumed by the overlay — meaning the caller must skip every other binding this poll.
+/// `?` always toggles the overlay; while it's showing, `Esc` also dismisses it and every other
+/// key is swallowed, so the player can't accidentally trigger a binding while reading what it
+/// does. While it's hidden, every key falls through unconsumed for the normal bindings to handle.
+fn keymap_overlay_update(show_keymap: bool, key: KeyCode) -> (bool, bool) {
+    match key {
+        KeyCode::Char('?') => (!show_keymap, true),
+        KeyCode::Esc if show_keymap => (false, true),
+        _ if show_keymap => (true, true),
+        _ => (show_keymap, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +641,50 @@ mod tests {
         let bass = bass_standard();
         assert_eq!(toggle_string_lock(&bass, None, 5), None);
         assert_eq!(toggle_string_lock(&bass, Some(2), 5), Some(2));
+    }
+
+    #[test]
+    fn question_mark_opens_the_keymap_overlay() {
+        assert_eq!(
+            keymap_overlay_update(false, KeyCode::Char('?')),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn question_mark_closes_the_keymap_overlay_again() {
+        assert_eq!(
+            keymap_overlay_update(true, KeyCode::Char('?')),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn esc_dismisses_the_keymap_overlay_while_it_is_open() {
+        assert_eq!(keymap_overlay_update(true, KeyCode::Esc), (false, true));
+    }
+
+    #[test]
+    fn esc_falls_through_unconsumed_when_the_overlay_is_closed() {
+        // The normal q/Esc-quits binding must still see this key.
+        assert_eq!(keymap_overlay_update(false, KeyCode::Esc), (false, false));
+    }
+
+    #[test]
+    fn every_other_key_is_swallowed_while_the_overlay_is_open() {
+        assert_eq!(
+            keymap_overlay_update(true, KeyCode::Tab),
+            (true, true),
+            "a normal binding must not fire while the overlay is showing"
+        );
+    }
+
+    #[test]
+    fn normal_keys_fall_through_unconsumed_when_the_overlay_is_closed() {
+        assert_eq!(
+            keymap_overlay_update(false, KeyCode::Tab),
+            (false, false)
+        );
     }
 
     #[test]
