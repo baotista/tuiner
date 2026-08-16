@@ -303,6 +303,17 @@ fn render_headstock_sidebar_and_split(
     }
 }
 
+/// A small, unobtrusive reminder that `?` opens the keymap recap overlay (issue #13) — otherwise
+/// nothing on screen ever names that key, and a first-time player has no way to discover it
+/// (issue #15). Part of both readout states' irreducible core: always drawn, never subject to the
+/// degradation ladder, the same way Note/Deviation/the Strobe already are.
+fn keymap_hint_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "? for keymap",
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+}
+
 fn render_listening(
     frame: &mut Frame,
     inner: Rect,
@@ -319,6 +330,7 @@ fn render_listening(
             string_label(*number, note)
         )));
     }
+    lines.push(keymap_hint_line());
     frame.render_widget(Paragraph::new(lines), main);
 }
 
@@ -364,6 +376,7 @@ fn render_reading(frame: &mut Frame, inner: Rect, tiers: &DegradationTiers, view
         lines.push(bar_line(view.cents, main_width, style));
     }
     lines.push(strobe_line(view.strobe_phase, main_width, style));
+    lines.push(keymap_hint_line());
 
     if tiers.trail {
         let remaining = (main.height as usize).saturating_sub(lines.len());
@@ -1127,6 +1140,55 @@ mod tests {
         );
         let text = buffer_text(&buf);
         assert!(text.contains("Locked") && text.contains("Str 5 A2"));
+    }
+
+    // --- Issue #15: keymap recap hint ---
+
+    #[test]
+    fn reading_shows_a_hint_naming_the_keymap_key() {
+        let buf = render_to_buffer(&reading(0.0), 60, 14);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains('?') && text.contains("keymap"),
+            "expected a hint naming the keymap key in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn listening_shows_a_hint_naming_the_keymap_key() {
+        let buf = render_to_buffer(
+            &Readout::Listening {
+                locked: None,
+                headstock: None,
+            },
+            60,
+            14,
+        );
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains('?') && text.contains("keymap"),
+            "expected a hint naming the keymap key in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn keymap_hint_still_shows_at_the_smallest_supported_size() {
+        let buf = render_to_buffer(&reading(0.0), MIN_SUPPORTED_WIDTH, MIN_SUPPORTED_HEIGHT);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("keymap"),
+            "expected the keymap hint even at the floor size, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn keymap_hint_does_not_push_the_trail_past_the_available_height() {
+        // Guards the height-budget interaction: the hint line must be counted before the Trail's
+        // `remaining` rows are computed, or the Trail would claim a row the hint needs.
+        let readout = guided_reading(Some(sample_headstock()), sample_trail());
+        let buf = render_to_buffer(&readout, 120, 36);
+        let text = buffer_text(&buf);
+        assert!(text.contains("keymap"), "expected the hint in:\n{text}");
     }
 
     fn render_picker_to_buffer(view: &PickerView, width: u16, height: u16) -> Buffer {
