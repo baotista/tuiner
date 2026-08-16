@@ -221,9 +221,8 @@ pub struct KeyBinding {
     pub description: &'static str,
 }
 
-/// Every binding currently wired up (issue #13) — the one place the recap overlay reads from, so
-/// a future binding (e.g. Reference Pitch's `+`/`-`, issue #12) only needs adding here to appear
-/// in the overlay too.
+/// Every binding currently wired up — the one place the recap overlay reads from, so a future
+/// binding only needs adding here to appear in the overlay too.
 pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: "Tab",
@@ -236,6 +235,10 @@ pub const KEYMAP: &[KeyBinding] = &[
     KeyBinding {
         keys: "1-6",
         description: "String Lock",
+    },
+    KeyBinding {
+        keys: "+ / -",
+        description: "adjust Reference Pitch",
     },
     KeyBinding {
         keys: "i",
