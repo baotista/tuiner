@@ -231,6 +231,10 @@ Note, Deviation and Strobe as the irreducible core, and refuse outright below ro
 `Tab` toggles Mode · `t` cycles Tuning · `1`–`6` String Lock · `i` reopens the input picker ·
 `+`/`-` adjust Reference Pitch · `?` keymap · `q`/`Esc` quit.
 
+A small, dimmed "`?` for keymap" line is always shown on the readout — alongside Note, Deviation
+and Strobe, it survives every small-terminal degradation — so a first-time player discovers the
+recap overlay without reading docs.
+
 `?` opens a recap of every binding above as an overlay on the current readout, so the player is
 never stuck guessing a key mid-session. The same key (or `Esc`) dismisses it. It only covers the
 screen — analysis keeps running underneath, so reopening the tuner shows an unpaused reading, not

@@ -1172,6 +1172,44 @@ mod tests {
     }
 
     #[test]
+    fn reading_shows_the_hint_in_guided_mode_too() {
+        let readout = Readout::Reading {
+            note: "A2".into(),
+            hz: 110.0,
+            cents: 0.0,
+            dimmed: false,
+            string_number: Some(5),
+            locked: false,
+            strobe_phase: 0.0,
+            trail: Vec::new(),
+            headstock: Some(sample_headstock()),
+        };
+        let buf = render_to_buffer(&readout, 70, 14);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains('?') && text.contains("keymap"),
+            "expected the hint in Guided Mode too, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn listening_shows_the_hint_in_guided_mode_too() {
+        let buf = render_to_buffer(
+            &Readout::Listening {
+                locked: None,
+                headstock: Some(sample_headstock()),
+            },
+            70,
+            14,
+        );
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains('?') && text.contains("keymap"),
+            "expected the hint in Guided Mode too, got:\n{text}"
+        );
+    }
+
+    #[test]
     fn keymap_hint_still_shows_at_the_smallest_supported_size() {
         let buf = render_to_buffer(&reading(0.0), MIN_SUPPORTED_WIDTH, MIN_SUPPORTED_HEIGHT);
         let text = buffer_text(&buf);
@@ -1182,13 +1220,18 @@ mod tests {
     }
 
     #[test]
-    fn keymap_hint_does_not_push_the_trail_past_the_available_height() {
-        // Guards the height-budget interaction: the hint line must be counted before the Trail's
-        // `remaining` rows are computed, or the Trail would claim a row the hint needs.
+    fn keymap_hint_survives_when_the_trail_fills_its_exact_height_budget() {
+        // At the precise threshold where the Trail tier turns on (inner 60x16), the Trail's
+        // `remaining` row budget must already have subtracted the hint's row — otherwise the
+        // Trail claims that row for itself and the hint gets clipped out of view rather than the
+        // Trail simply rendering one row shorter.
         let readout = guided_reading(Some(sample_headstock()), sample_trail());
-        let buf = render_to_buffer(&readout, 120, 36);
+        let buf = render_to_buffer(&readout, 62, 18); // inner: 60x16, exactly TRAIL_MIN_HEIGHT
         let text = buffer_text(&buf);
-        assert!(text.contains("keymap"), "expected the hint in:\n{text}");
+        assert!(
+            text.contains("keymap"),
+            "expected the hint to survive the Trail's height budget, got:\n{text}"
+        );
     }
 
     fn render_picker_to_buffer(view: &PickerView, width: u16, height: u16) -> Buffer {
