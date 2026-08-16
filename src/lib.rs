@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod config;
 pub mod detect;
 pub mod gate;
 pub mod picker;

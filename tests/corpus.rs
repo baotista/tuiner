@@ -164,7 +164,7 @@ fn bass_low_e_crosses_the_e1_e2_boundary_about_ten_times() {
 #[test]
 fn bass_low_e_frames_match_bass_standards_e1_string_through_guided_mode() {
     let frames = frames_from_clip("corpus/bass-low-e.wav");
-    let bass = tuning::all()
+    let bass = tuning::all(pitch::DEFAULT_REFERENCE_PITCH)
         .into_iter()
         .find(|t| t.name == "Bass Standard")
         .unwrap();
@@ -177,7 +177,7 @@ fn bass_low_e_frames_match_bass_standards_e1_string_through_guided_mode() {
                 continue;
             }
             e1_frames_checked += 1;
-            match bass.match_pitch(*hz) {
+            match bass.match_pitch(*hz, pitch::DEFAULT_REFERENCE_PITCH) {
                 tuning::Match::String { number, note, .. } => {
                     assert_eq!(number, 4, "E1 matched String {number} ({note}) instead");
                     assert_eq!(note, "E1");

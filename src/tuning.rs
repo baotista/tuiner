@@ -10,7 +10,17 @@
 //! [`StringStatus`] is the small piece of session progress the Headstock panel (issue #10)
 //! renders per String — untouched, currently sounding, or already in tune.
 
+use serde::{Deserialize, Serialize};
+
 use crate::pitch;
+
+/// Whether the app is naming bare Notes or matching against a chosen Tuning's Strings — toggled
+/// with `Tab`, and one of the values Config persistence (issue #12) remembers across a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mode {
+    Chromatic,
+    Guided,
+}
 
 /// Half the distance to the nearest neighbouring Target Pitch, minus this margin, is what a
 /// String's Capture Range actually uses — so two Strings' ranges never touch, let alone overlap.
@@ -67,10 +77,11 @@ pub enum Match {
 
 impl Tuning {
     /// Matches `hz` to the nearest String, but only reports it if `hz` actually falls within
-    /// that String's own Capture Range — otherwise falls back to naming the nearest Note. Ranges
-    /// never overlap by construction (see [`capture_ranges`]), so the String nearest by raw
-    /// distance is always the one whose range would contain `hz`, if any range does.
-    pub fn match_pitch(&self, hz: f32) -> Match {
+    /// that String's own Capture Range — otherwise falls back to naming the nearest Note against
+    /// `reference_pitch`. Ranges never overlap by construction (see [`capture_ranges`]), so the
+    /// String nearest by raw distance is always the one whose range would contain `hz`, if any
+    /// range does.
+    pub fn match_pitch(&self, hz: f32, reference_pitch: f32) -> Match {
         let nearest = self
             .strings
             .iter()
@@ -84,7 +95,7 @@ impl Tuning {
                 cents,
             },
             _ => {
-                let (note, cents) = pitch::nearest_note(hz, pitch::DEFAULT_REFERENCE_PITCH);
+                let (note, cents) = pitch::nearest_note(hz, reference_pitch);
                 Match::Note { note, cents }
             }
         }
@@ -139,19 +150,13 @@ fn cents_between(a_hz: f32, b_hz: f32) -> f32 {
 /// than two bare integers.
 type StringDef = (u8, i32);
 
-/// Builds a Tuning from `StringDef`s in any order — Capture Ranges are derived by Target Pitch,
-/// not by the order given, and Strings are returned numbered 1..N for display regardless of
-/// pitch order.
-fn build(name: &'static str, strings: &[StringDef]) -> Tuning {
+/// Builds a Tuning from `StringDef`s in any order at the given Reference Pitch — Capture Ranges
+/// are derived by Target Pitch, not by the order given, and Strings are returned numbered 1..N for
+/// display regardless of pitch order.
+fn build(name: &'static str, strings: &[StringDef], reference_pitch: f32) -> Tuning {
     let mut entries: Vec<(u8, i32, f32)> = strings
         .iter()
-        .map(|&(number, midi)| {
-            (
-                number,
-                midi,
-                pitch::midi_to_hz(midi, pitch::DEFAULT_REFERENCE_PITCH),
-            )
-        })
+        .map(|&(number, midi)| (number, midi, pitch::midi_to_hz(midi, reference_pitch)))
         .collect();
     entries.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
 
@@ -175,26 +180,35 @@ fn build(name: &'static str, strings: &[StringDef]) -> Tuning {
     Tuning { name, strings }
 }
 
-/// The five Tunings the app ships, in the order `t` cycles through them.
-pub fn all() -> Vec<Tuning> {
+/// The five Tunings the app ships, in the order `t` cycles through them, with every Target Pitch
+/// derived from `reference_pitch` — changing it moves every Tuning's Target Pitches together.
+pub fn all(reference_pitch: f32) -> Vec<Tuning> {
     vec![
         build(
             "Guitar Standard",
             &[(1, 64), (2, 59), (3, 55), (4, 50), (5, 45), (6, 40)],
+            reference_pitch,
         ),
         build(
             "Guitar D Standard",
             &[(1, 62), (2, 57), (3, 53), (4, 48), (5, 43), (6, 38)],
+            reference_pitch,
         ),
         build(
             "Guitar Open C",
             &[(1, 64), (2, 60), (3, 55), (4, 48), (5, 43), (6, 36)],
+            reference_pitch,
         ),
         build(
             "DADGAD",
             &[(1, 62), (2, 57), (3, 55), (4, 50), (5, 45), (6, 38)],
+            reference_pitch,
         ),
-        build("Bass Standard", &[(1, 43), (2, 38), (3, 33), (4, 28)]),
+        build(
+            "Bass Standard",
+            &[(1, 43), (2, 38), (3, 33), (4, 28)],
+            reference_pitch,
+        ),
     ]
 }
 
@@ -203,12 +217,15 @@ mod tests {
     use super::*;
 
     fn tuning(name: &str) -> Tuning {
-        all().into_iter().find(|t| t.name == name).unwrap()
+        all(pitch::DEFAULT_REFERENCE_PITCH)
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap()
     }
 
     #[test]
     fn all_five_tunings_are_present_with_correct_target_pitches() {
-        let tunings = all();
+        let tunings = all(pitch::DEFAULT_REFERENCE_PITCH);
         assert_eq!(tunings.len(), 5);
 
         let by_name = |name: &str| tunings.iter().find(|t| t.name == name).unwrap();
@@ -244,7 +261,7 @@ mod tests {
     fn no_two_strings_in_any_tuning_can_both_claim_the_same_pitch() {
         // Sweep every whole cent across the full detector range and confirm at most one String
         // in each Tuning ever claims it.
-        for tuning in all() {
+        for tuning in all(pitch::DEFAULT_REFERENCE_PITCH) {
             let mut hz = crate::MIN_HZ;
             while hz <= crate::MAX_HZ {
                 let claimants = tuning
@@ -297,7 +314,7 @@ mod tests {
     #[test]
     fn a_bass_low_e_does_not_claim_a_sub_40hz_rumble() {
         let bass = tuning("Bass Standard");
-        match bass.match_pitch(20.0) {
+        match bass.match_pitch(20.0, pitch::DEFAULT_REFERENCE_PITCH) {
             Match::String { note, .. } => panic!("20 Hz rumble was claimed as {note}"),
             Match::Note { .. } => {}
         }
@@ -311,7 +328,7 @@ mod tests {
         // guessing wrong while the player is still turning the Peg.
         let g3_hz = pitch::midi_to_hz(55, pitch::DEFAULT_REFERENCE_PITCH);
         let two_semitones_flat_of_g3 = g3_hz / 2f32.powf(2.0 / 12.0);
-        match dadgad.match_pitch(two_semitones_flat_of_g3) {
+        match dadgad.match_pitch(two_semitones_flat_of_g3, pitch::DEFAULT_REFERENCE_PITCH) {
             Match::String { note, cents, .. } => {
                 panic!("expected a Note fallback, got String {note} at {cents:+.1}c")
             }
@@ -327,7 +344,7 @@ mod tests {
         let e4_hz = pitch::midi_to_hz(64, pitch::DEFAULT_REFERENCE_PITCH);
         let e2_hz = pitch::midi_to_hz(40, pitch::DEFAULT_REFERENCE_PITCH);
 
-        match standard.match_pitch(e4_hz) {
+        match standard.match_pitch(e4_hz, pitch::DEFAULT_REFERENCE_PITCH) {
             Match::String {
                 number,
                 note,
@@ -340,7 +357,7 @@ mod tests {
             Match::Note { note, .. } => panic!("expected String 1 (E4), got Note {note}"),
         }
 
-        match standard.match_pitch(e2_hz) {
+        match standard.match_pitch(e2_hz, pitch::DEFAULT_REFERENCE_PITCH) {
             Match::String {
                 number,
                 note,
@@ -364,7 +381,7 @@ mod tests {
         let dead_zone = a2_hz * 2f32.powf(250.0 / 1200.0);
 
         assert!(matches!(
-            standard.match_pitch(dead_zone),
+            standard.match_pitch(dead_zone, pitch::DEFAULT_REFERENCE_PITCH),
             Match::Note { .. }
         ));
 
@@ -396,5 +413,41 @@ mod tests {
         let bass = tuning("Bass Standard");
         assert!(bass.string(5).is_none());
         assert!(bass.string(1).is_some());
+    }
+
+    #[test]
+    fn changing_reference_pitch_moves_every_target_pitch() {
+        let at_440 = all(440.0);
+        let at_442 = all(442.0);
+        for (t440, t442) in at_440.iter().zip(at_442.iter()) {
+            for (s440, s442) in t440.strings.iter().zip(t442.strings.iter()) {
+                assert!(
+                    s442.target_hz > s440.target_hz,
+                    "{}'s {} Target Pitch did not move with Reference Pitch",
+                    t440.name,
+                    s440.note
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn match_pitch_names_the_note_fallback_against_the_given_reference_pitch() {
+        let bass = tuning("Bass Standard");
+        // Deep in the dead zone between Strings, so both calls fall back to naming a Note rather
+        // than a String — exactly the path whose `reference_pitch` argument this test covers.
+        let a1_hz = pitch::midi_to_hz(33, pitch::DEFAULT_REFERENCE_PITCH);
+        let dead_zone = a1_hz * 2f32.powf(250.0 / 1200.0);
+
+        let Match::Note { cents: at_440, .. } = bass.match_pitch(dead_zone, 440.0) else {
+            panic!("expected a Note fallback at 440Hz");
+        };
+        let Match::Note { cents: at_442, .. } = bass.match_pitch(dead_zone, 442.0) else {
+            panic!("expected a Note fallback at 442Hz");
+        };
+        assert_ne!(
+            at_440, at_442,
+            "the Note fallback's Deviation must depend on the given Reference Pitch"
+        );
     }
 }

@@ -2,8 +2,21 @@
 //! between them. Tiny interface, used everywhere, essentially frozen once written.
 
 /// The frequency assigned to A4, from which every other Note's frequency is derived. A4 = 440 Hz
-/// until Reference Pitch persistence lands.
+/// unless the player has adjusted it.
 pub const DEFAULT_REFERENCE_PITCH: f32 = 440.0;
+
+/// The sane range Reference Pitch is clamped to — from Baroque pitch at the low end to the
+/// highest pitch still in common use at the top, comfortably spanning every ensemble a player is
+/// actually likely to tune against.
+pub const MIN_REFERENCE_PITCH: f32 = 415.0;
+pub const MAX_REFERENCE_PITCH: f32 = 466.0;
+
+/// Clamps a Reference Pitch to `[MIN_REFERENCE_PITCH, MAX_REFERENCE_PITCH]` — the one place that
+/// range is enforced, shared by the `+`/`-` adjustment keys and by a Reference Pitch loaded from a
+/// hand-edited config file.
+pub fn clamp_reference_pitch(hz: f32) -> f32 {
+    hz.clamp(MIN_REFERENCE_PITCH, MAX_REFERENCE_PITCH)
+}
 
 /// The Deviation band inside which a String (or, in Chromatic Mode, a Note) counts as correctly
 /// tuned.
@@ -124,5 +137,20 @@ mod tests {
     fn negative_midi_numbers_floor_the_octave_correctly() {
         let (note, _cents) = nearest_note(30.868, 2000.0);
         assert_eq!(note, "A-2", "octave floored toward zero instead of down");
+    }
+
+    #[test]
+    fn clamp_reference_pitch_leaves_an_in_range_value_untouched() {
+        assert_eq!(clamp_reference_pitch(440.0), 440.0);
+    }
+
+    #[test]
+    fn clamp_reference_pitch_floors_at_the_minimum() {
+        assert_eq!(clamp_reference_pitch(300.0), MIN_REFERENCE_PITCH);
+    }
+
+    #[test]
+    fn clamp_reference_pitch_ceilings_at_the_maximum() {
+        assert_eq!(clamp_reference_pitch(600.0), MAX_REFERENCE_PITCH);
     }
 }

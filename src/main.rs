@@ -28,10 +28,12 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use rtrb::RingBuffer;
 use tuiner::audio::{AudioSource, EnumeratedDevice, LevelMeter, LiveCapture, list_input_devices};
+use tuiner::config::{self, Config};
 use tuiner::picker::{DeviceEntry, Outcome, Picker, Selection, Step};
 use tuiner::pipeline::{Frame, Pipeline, Polled};
 use tuiner::strobe::Strobe;
 use tuiner::trail::{Trail, TrailSample};
+use tuiner::tuning::Mode;
 use tuiner::ui::{self, HeadstockView, PickerView, Readout, StringView};
 use tuiner::{pitch, trail_capacity, tuning, window_samples};
 
@@ -58,15 +60,50 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    let config_path = config::default_path();
+    let (loaded_config, config_error) = match config::load(&config_path) {
+        Ok(cfg) => (cfg, None),
+        // A malformed config must be reported but never fatal — the app falls back to the
+        // picker and defaults exactly as it would on a genuine first run.
+        Err(msg) => (None, Some(msg)),
+    };
+    if let Some(msg) = &config_error {
+        eprintln!("{msg}");
+    }
+
+    let mut state = PlayerState::new();
+    if let Some(cfg) = &loaded_config {
+        state.reference_pitch = pitch::clamp_reference_pitch(cfg.reference_pitch);
+        state.mode = cfg.mode;
+        state.tuning_idx = tuning::all(state.reference_pitch)
+            .iter()
+            .position(|t| t.name == cfg.tuning)
+            .unwrap_or(0);
+    }
+
     // Resolved to a concrete Device right away, while `startup_devices` still matches what was
-    // just validated against — nothing downstream needs to re-derive it from an index again.
-    let mut pending: Option<(cpal::Device, usize)> =
-        cli_selection.map(|s| (startup_devices[s.device_idx].device.clone(), s.channel_idx));
+    // just validated against — nothing downstream needs to re-derive it from an index again. CLI
+    // flags win outright; otherwise fall back to the remembered Input Device from config, if it's
+    // still among the Input Devices actually present right now.
+    let remembered = remembered_selection(&loaded_config, &startup_entries);
+    let mut pending: Option<(cpal::Device, usize)> = cli_selection
+        .or(remembered)
+        .map(|s| (startup_devices[s.device_idx].device.clone(), s.channel_idx));
 
     let mut terminal = ratatui::init();
     let mut last_good = pending.clone();
     let mut cancellable = false;
-    let mut message = None;
+    // A remembered Input Device that has vanished must reopen the picker with an explanation
+    // rather than silently falling through to a different device — only reachable when nothing
+    // else (a CLI flag) already resolved `pending`.
+    let mut message = config_error.or_else(|| match (&loaded_config, &pending) {
+        (Some(cfg), None) => Some(format!(
+            "Remembered Input Device '{}' is no longer available — pick again.",
+            cfg.device_name
+        )),
+        _ => None,
+    });
     let mut exit_message = None;
 
     loop {
@@ -93,6 +130,7 @@ fn main() {
             }
         };
         last_good = Some((device.clone(), channel_idx));
+        let device_name = device.to_string();
 
         let source = match LiveCapture::open(device, channel_idx) {
             Ok(source) => source,
@@ -103,7 +141,12 @@ fn main() {
             }
         };
 
-        match run_tuning(&mut terminal, source) {
+        // Written as soon as an Input Device is confirmed — first run writes the config right
+        // here, before a single Pitch has even been read — and again after `run_tuning` returns,
+        // so any Mode/Tuning/Reference Pitch change made during the session survives too.
+        save_config(&config_path, &device_name, channel_idx, &state);
+
+        match run_tuning(&mut terminal, source, &mut state) {
             TuningExit::Quit => break,
             TuningExit::ReopenPicker => {
                 cancellable = true;
@@ -116,11 +159,46 @@ fn main() {
                 message = Some("Input Device disappeared — pick again.".to_string());
             }
         }
+        save_config(&config_path, &device_name, channel_idx, &state);
     }
 
     ratatui::restore();
     if let Some(msg) = exit_message {
         println!("{msg}");
+    }
+}
+
+/// Resolves a loaded Config's remembered Input Device against the Input Devices actually present
+/// at startup. `None` covers every case that must fall back to the picker rather than silently
+/// substitute something else: no config at all, the remembered device no longer present, or its
+/// remembered Input Channel no longer valid for it (fewer channels than before).
+fn remembered_selection(config: &Option<Config>, entries: &[DeviceEntry]) -> Option<Selection> {
+    let config = config.as_ref()?;
+    let device_idx = entries.iter().position(|e| e.name == config.device_name)?;
+    if config.channel >= entries[device_idx].channels as usize {
+        return None;
+    }
+    Some(Selection {
+        device_idx,
+        channel_idx: config.channel,
+    })
+}
+
+/// Writes the full persisted Config — the just-confirmed Input Device/Channel plus whatever
+/// Mode/Tuning/Reference Pitch `state` currently holds. A write failure is reported, not fatal:
+/// nothing about disk trouble should stop the player tuning.
+fn save_config(path: &std::path::Path, device_name: &str, channel_idx: usize, state: &PlayerState) {
+    let config = Config {
+        device_name: device_name.to_string(),
+        channel: channel_idx,
+        tuning: tuning::all(state.reference_pitch)[state.tuning_idx]
+            .name
+            .to_string(),
+        mode: state.mode,
+        reference_pitch: state.reference_pitch,
+    };
+    if let Err(err) = config::save(path, &config) {
+        eprintln!("could not save config: {err}");
     }
 }
 
@@ -261,15 +339,31 @@ enum TuningExit {
     DeviceLost,
 }
 
-/// Whether the app is naming bare Notes or matching against a chosen Tuning's Strings — toggled
-/// with `Tab`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Chromatic,
-    Guided,
+/// The three pieces of state Config persistence remembers across a restart (issue #12). Kept
+/// together since they always travel as one unit between `main`'s reconnect loop and
+/// `run_tuning` — surviving a `ReopenPicker`/`DeviceLost` round trip within the same run, not just
+/// reset to defaults, and read back out afterwards to write the config.
+struct PlayerState {
+    mode: Mode,
+    tuning_idx: usize,
+    reference_pitch: f32,
 }
 
-fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit {
+impl PlayerState {
+    fn new() -> Self {
+        Self {
+            mode: Mode::Chromatic,
+            tuning_idx: 0,
+            reference_pitch: pitch::DEFAULT_REFERENCE_PITCH,
+        }
+    }
+}
+
+fn run_tuning(
+    terminal: &mut DefaultTerminal,
+    source: LiveCapture,
+    state: &mut PlayerState,
+) -> TuningExit {
     let sample_rate = source.sample_rate();
     let window = window_samples(sample_rate);
 
@@ -285,9 +379,7 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     let mut last_pitched: Option<Instant> = None;
     let mut trail = Trail::new(trail_capacity());
 
-    let tunings = tuning::all();
-    let mut mode = Mode::Chromatic;
-    let mut tuning_idx = 0usize;
+    let mut tunings = tuning::all(state.reference_pitch);
     // Which String the player has named explicitly, so matching stops refusing to guess for a
     // fresh string that starts far too flat to fall inside any Capture Range. Only meaningful in
     // Guided Mode; a Tuning change clears it, since the Target Pitch it referred to has changed.
@@ -324,19 +416,30 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                     KeyCode::Char('q') | KeyCode::Esc => return TuningExit::Quit,
                     KeyCode::Char('i') => return TuningExit::ReopenPicker,
                     KeyCode::Tab => {
-                        mode = match mode {
+                        state.mode = match state.mode {
                             Mode::Chromatic => Mode::Guided,
                             Mode::Guided => Mode::Chromatic,
                         }
                     }
                     KeyCode::Char('t') => {
-                        tuning_idx = (tuning_idx + 1) % tunings.len();
+                        state.tuning_idx = (state.tuning_idx + 1) % tunings.len();
                         string_lock = None;
                         reached_in_tune.clear();
                     }
-                    KeyCode::Char(c @ '1'..='6') if mode == Mode::Guided => {
+                    KeyCode::Char(c @ '1'..='6') if state.mode == Mode::Guided => {
                         let n = c.to_digit(10).expect("guarded by '1'..='6'") as u8;
-                        string_lock = toggle_string_lock(&tunings[tuning_idx], string_lock, n);
+                        string_lock =
+                            toggle_string_lock(&tunings[state.tuning_idx], string_lock, n);
+                    }
+                    KeyCode::Char('+') => {
+                        state.reference_pitch =
+                            pitch::clamp_reference_pitch(state.reference_pitch + 1.0);
+                        tunings = tuning::all(state.reference_pitch);
+                    }
+                    KeyCode::Char('-') => {
+                        state.reference_pitch =
+                            pitch::clamp_reference_pitch(state.reference_pitch - 1.0);
+                        tunings = tuning::all(state.reference_pitch);
                     }
                     _ => {}
                 }
@@ -348,7 +451,13 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                 let live = matches!(frame, Frame::Pitched { .. });
                 readout = match hz_reading(frame) {
                     Some((hz, dimmed)) => {
-                        let named = name_pitch(mode, &tunings[tuning_idx], string_lock, hz);
+                        let named = name_pitch(
+                            state.mode,
+                            &tunings[state.tuning_idx],
+                            string_lock,
+                            hz,
+                            state.reference_pitch,
+                        );
                         let mut sounding = None;
                         if live {
                             sounding = named.string_number;
@@ -380,8 +489,8 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                             strobe_phase: strobe.phase(),
                             trail: trail.padded_samples(),
                             headstock: headstock_view(
-                                mode,
-                                &tunings[tuning_idx],
+                                state.mode,
+                                &tunings[state.tuning_idx],
                                 &reached_in_tune,
                                 sounding,
                             ),
@@ -391,10 +500,14 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
                         trail.push(TrailSample::Gap);
                         last_pitched = None;
                         Readout::Listening {
-                            locked: locked_target(mode, &tunings[tuning_idx], string_lock),
+                            locked: locked_target(
+                                state.mode,
+                                &tunings[state.tuning_idx],
+                                string_lock,
+                            ),
                             headstock: headstock_view(
-                                mode,
-                                &tunings[tuning_idx],
+                                state.mode,
+                                &tunings[state.tuning_idx],
                                 &reached_in_tune,
                                 None,
                             ),
@@ -406,7 +519,11 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
             Polled::Pending => {}
         }
 
-        let label = mode_label(mode, tunings[tuning_idx].name);
+        let label = mode_label(
+            state.mode,
+            tunings[state.tuning_idx].name,
+            state.reference_pitch,
+        );
         terminal
             .draw(|f| {
                 ui::render(f, f.area(), &readout, &label);
@@ -418,12 +535,19 @@ fn run_tuning(terminal: &mut DefaultTerminal, source: LiveCapture) -> TuningExit
     }
 }
 
-/// What `Tab`/`t` last landed on, for the border title — the only on-screen sign of the current
-/// Mode and Tuning until the Cockpit's status area (issue #11) takes that job over.
-fn mode_label(mode: Mode, tuning_name: &str) -> String {
-    match mode {
+/// What `Tab`/`t`/`+`/`-` last landed on, for the border title — the only on-screen sign of the
+/// current Mode, Tuning and Reference Pitch until the Cockpit's status area (issue #11) takes
+/// that job over. Reference Pitch only appears once it differs from the default, so the common
+/// case stays uncluttered.
+fn mode_label(mode: Mode, tuning_name: &str, reference_pitch: f32) -> String {
+    let base = match mode {
         Mode::Chromatic => "Chromatic".to_string(),
         Mode::Guided => format!("Guided — {tuning_name}"),
+    };
+    if (reference_pitch - pitch::DEFAULT_REFERENCE_PITCH).abs() < 0.5 {
+        base
+    } else {
+        format!("{base} (A4={reference_pitch:.0}Hz)")
     }
 }
 
@@ -468,8 +592,17 @@ fn active_lock(
 
 /// Names `hz` per the current Mode: a bare Note in Chromatic Mode; in Guided Mode, the locked
 /// String's Deviation however far `hz` is (ignoring `tuning`'s Capture Range) if a String Lock is
-/// active, otherwise a String within Capture Range or the nearest Note as a fallback.
-fn name_pitch(mode: Mode, tuning: &tuning::Tuning, string_lock: Option<u8>, hz: f32) -> PitchName {
+/// active, otherwise a String within Capture Range or the nearest Note as a fallback. `hz` itself
+/// already reflects `reference_pitch` (it comes from the detector, not from this function), but
+/// naming a Note — either in Chromatic Mode or as Guided Mode's fallback — still needs it to work
+/// out which Note `hz` is nearest to.
+fn name_pitch(
+    mode: Mode,
+    tuning: &tuning::Tuning,
+    string_lock: Option<u8>,
+    hz: f32,
+    reference_pitch: f32,
+) -> PitchName {
     if let Some(s) = active_lock(mode, tuning, string_lock) {
         let Some(tuning::Match::String {
             number,
@@ -489,7 +622,7 @@ fn name_pitch(mode: Mode, tuning: &tuning::Tuning, string_lock: Option<u8>, hz: 
 
     match mode {
         Mode::Chromatic => {
-            let (note, cents) = pitch::nearest_note(hz, pitch::DEFAULT_REFERENCE_PITCH);
+            let (note, cents) = pitch::nearest_note(hz, reference_pitch);
             PitchName {
                 note,
                 cents,
@@ -497,7 +630,7 @@ fn name_pitch(mode: Mode, tuning: &tuning::Tuning, string_lock: Option<u8>, hz: 
                 locked: false,
             }
         }
-        Mode::Guided => match tuning.match_pitch(hz) {
+        Mode::Guided => match tuning.match_pitch(hz, reference_pitch) {
             tuning::Match::String {
                 number,
                 note,
@@ -602,16 +735,30 @@ mod tests {
 
     #[test]
     fn chromatic_mode_label_names_no_tuning() {
-        assert_eq!(mode_label(Mode::Chromatic, "DADGAD"), "Chromatic");
+        assert_eq!(
+            mode_label(Mode::Chromatic, "DADGAD", pitch::DEFAULT_REFERENCE_PITCH),
+            "Chromatic"
+        );
     }
 
     #[test]
     fn guided_mode_label_names_the_current_tuning() {
-        assert_eq!(mode_label(Mode::Guided, "DADGAD"), "Guided — DADGAD");
+        assert_eq!(
+            mode_label(Mode::Guided, "DADGAD", pitch::DEFAULT_REFERENCE_PITCH),
+            "Guided — DADGAD"
+        );
+    }
+
+    #[test]
+    fn mode_label_shows_a_non_default_reference_pitch() {
+        assert_eq!(
+            mode_label(Mode::Chromatic, "DADGAD", 443.0),
+            "Chromatic (A4=443Hz)"
+        );
     }
 
     fn bass_standard() -> tuning::Tuning {
-        tuning::all()
+        tuning::all(pitch::DEFAULT_REFERENCE_PITCH)
             .into_iter()
             .find(|t| t.name == "Bass Standard")
             .unwrap()
@@ -758,7 +905,13 @@ mod tests {
         // Far below D2 (String 2) — well outside any Capture Range, exactly the fresh-string
         // case a Lock exists for.
         let far_flat_of_d2 = pitch::midi_to_hz(38, pitch::DEFAULT_REFERENCE_PITCH) / 4.0;
-        let named = name_pitch(Mode::Guided, &bass, Some(2), far_flat_of_d2);
+        let named = name_pitch(
+            Mode::Guided,
+            &bass,
+            Some(2),
+            far_flat_of_d2,
+            pitch::DEFAULT_REFERENCE_PITCH,
+        );
         assert_eq!(named.note, "D2");
         assert_eq!(named.string_number, Some(2));
         assert!(named.locked);
@@ -773,7 +926,13 @@ mod tests {
     fn name_pitch_ignores_a_lock_in_chromatic_mode() {
         let bass = bass_standard();
         let a1_hz = pitch::midi_to_hz(33, pitch::DEFAULT_REFERENCE_PITCH);
-        let named = name_pitch(Mode::Chromatic, &bass, Some(2), a1_hz);
+        let named = name_pitch(
+            Mode::Chromatic,
+            &bass,
+            Some(2),
+            a1_hz,
+            pitch::DEFAULT_REFERENCE_PITCH,
+        );
         assert_eq!(named.note, "A1");
         assert_eq!(named.string_number, None);
         assert!(!named.locked);
@@ -886,5 +1045,48 @@ mod tests {
             channel: Some(5),
         };
         assert!(resolve_cli_selection(&cli, &entries).is_err());
+    }
+
+    fn config_with(device_name: &str, channel: usize) -> Config {
+        Config {
+            device_name: device_name.to_string(),
+            channel,
+            tuning: "Guitar Standard".to_string(),
+            mode: Mode::Chromatic,
+            reference_pitch: pitch::DEFAULT_REFERENCE_PITCH,
+        }
+    }
+
+    #[test]
+    fn remembered_selection_is_none_without_a_config() {
+        let entries = entries(&[2]);
+        assert_eq!(remembered_selection(&None, &entries), None);
+    }
+
+    #[test]
+    fn remembered_selection_finds_the_device_by_name() {
+        let entries = entries(&[1, 2]);
+        let config = Some(config_with("device-1", 1));
+        assert_eq!(
+            remembered_selection(&config, &entries),
+            Some(Selection {
+                device_idx: 1,
+                channel_idx: 1
+            })
+        );
+    }
+
+    #[test]
+    fn remembered_selection_is_none_when_the_device_name_is_not_present() {
+        let entries = entries(&[1, 2]);
+        let config = Some(config_with("vanished-device", 0));
+        assert_eq!(remembered_selection(&config, &entries), None);
+    }
+
+    #[test]
+    fn remembered_selection_is_none_when_the_remembered_channel_is_now_out_of_range() {
+        let entries = entries(&[1]); // device-0 now has only 1 channel
+        let config = Some(config_with("device-0", 3));
+        assert_eq!(remembered_selection(&config, &entries), None);
     }
 }
