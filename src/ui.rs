@@ -17,7 +17,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::picker::{DeviceEntry, Step};
 use crate::pitch::IN_TUNE_TOLERANCE_CENTS;
@@ -213,6 +213,66 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
     // Wrapped, not clipped: a narrow-enough terminal would otherwise cut the message off before
     // it ever names the size actually needed — the one thing this screen exists to say.
     frame.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), area);
+}
+
+/// One line of the keymap recap overlay: the key(s) that trigger a binding and what it does.
+pub struct KeyBinding {
+    pub keys: &'static str,
+    pub description: &'static str,
+}
+
+/// Every binding currently wired up (issue #13) — the one place the recap overlay reads from, so
+/// a future binding (e.g. Reference Pitch's `+`/`-`, issue #12) only needs adding here to appear
+/// in the overlay too.
+pub const KEYMAP: &[KeyBinding] = &[
+    KeyBinding {
+        keys: "Tab",
+        description: "toggle Mode",
+    },
+    KeyBinding {
+        keys: "t",
+        description: "cycle Tuning",
+    },
+    KeyBinding {
+        keys: "1-6",
+        description: "String Lock",
+    },
+    KeyBinding {
+        keys: "i",
+        description: "reopen input picker",
+    },
+    KeyBinding {
+        keys: "?",
+        description: "toggle this keymap",
+    },
+    KeyBinding {
+        keys: "q / Esc",
+        description: "quit",
+    },
+];
+
+/// The keymap recap overlay (issue #13): a bordered box covering the whole frame, listing every
+/// `KEYMAP` binding. Drawn as an extra widget after `render`'s own draw call, on top of whatever
+/// readout is already on screen — the caller keeps polling and drawing the readout underneath at
+/// its usual rate, so dismissing the overlay shows a live reading rather than a stale one.
+///
+/// Below `MIN_SUPPORTED_WIDTH`/`MIN_SUPPORTED_HEIGHT` this draws nothing at all, the same floor
+/// `render` enforces — otherwise it would cover up `render_too_small`'s message with a box no more
+/// legible than what it's hiding.
+pub fn render_keymap_overlay(frame: &mut Frame, area: Rect) {
+    if area.width < MIN_SUPPORTED_WIDTH || area.height < MIN_SUPPORTED_HEIGHT {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let block = Block::default().borders(Borders::ALL).title(" Keymap ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = KEYMAP
+        .iter()
+        .map(|b| Line::from(format!("{:<8}{}", b.keys, b.description)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// Renders the Headstock sidebar (if `tiers.headstock_space` allows it and Guided Mode has one)
@@ -833,6 +893,65 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+
+    fn render_keymap_overlay_to_buffer(width: u16, height: u16) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_keymap_overlay(f, f.area()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn keymap_overlay_lists_every_binding() {
+        let text = buffer_text(&render_keymap_overlay_to_buffer(60, 20));
+        for binding in KEYMAP {
+            assert!(
+                text.contains(binding.keys) && text.contains(binding.description),
+                "expected '{}: {}' in:\n{text}",
+                binding.keys,
+                binding.description
+            );
+        }
+    }
+
+    #[test]
+    fn keymap_overlay_fits_the_smallest_supported_terminal_size_without_overflow() {
+        // TestBackend panics on any out-of-bounds write, so simply completing draw() at exactly
+        // the smallest supported size proves the overlay doesn't overflow it.
+        let buf = render_keymap_overlay_to_buffer(MIN_SUPPORTED_WIDTH, MIN_SUPPORTED_HEIGHT);
+        let text = buffer_text(&buf);
+        for binding in KEYMAP {
+            assert!(
+                text.contains(binding.keys),
+                "expected '{}' to still fit at the minimum supported size, got:\n{text}",
+                binding.keys
+            );
+        }
+    }
+
+    #[test]
+    fn keymap_overlay_never_overflows_at_various_supported_terminal_sizes() {
+        for (width, height) in [(40u16, 12u16), (60, 14), (80, 24), (120, 36)] {
+            let buf = render_keymap_overlay_to_buffer(width, height);
+            assert_eq!(buf.area.width, width);
+            assert_eq!(buf.area.height, height);
+        }
+    }
+
+    #[test]
+    fn keymap_overlay_draws_nothing_below_the_minimum_supported_size() {
+        // Below MIN_SUPPORTED_WIDTH/HEIGHT, `render` shows the "terminal too small" message
+        // instead of the readout — the overlay must not cover it up with a box of its own.
+        let buf =
+            render_keymap_overlay_to_buffer(MIN_SUPPORTED_WIDTH - 1, MIN_SUPPORTED_HEIGHT - 1);
+        let text = buffer_text(&buf);
+        assert!(
+            !text.contains("Keymap"),
+            "expected no overlay content below the minimum supported size, got:\n{text}"
+        );
+    }
 
     fn render_to_buffer(readout: &Readout, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
