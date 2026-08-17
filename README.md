@@ -41,6 +41,8 @@ Download `tuiner-macos-arm64` from the [Releases page](https://github.com/baotis
 then make it executable and let macOS know it's safe to run — downloaded binaries are quarantined
 by default and refuse to launch until you clear that flag once:
 
+(A `tuiner-linux-x86_64` binary is also published, but it's untested — see Platform support above.)
+
 ```sh
 chmod +x tuiner-macos-arm64
 xattr -d com.apple.quarantine tuiner-macos-arm64
