@@ -1,6 +1,12 @@
 # Tuiner
 
-A terminal instrument tuner for guitar and bass. It listens to a chosen audio input, works out
+A terminal instrument tuner for guitar and bass.
+If, like me, you are a musician and a nerd, you might find handy to have a simple tuner inside your terminal. Free forever, without ads, just the useful stuff.
+
+![input selection](images/SCR-20260817-lepa.png)
+![tuning a guitar](images/SCR-20260817-letg.png)
+
+It listens to a chosen audio input, works out
 what pitch is sounding, and shows which way to turn the peg — with a strobe display precise enough
 that a chord rings true afterwards.
 
@@ -31,17 +37,37 @@ is cross-platform, but Windows and Linux haven't been verified — expect rough 
 
 ### Option 1: download a prebuilt binary
 
-Grab `tuiner-macos-arm64` from the [Releases page](https://github.com/baotista/tuiner/releases),
-then:
+Download `tuiner-macos-arm64` from the [Releases page](https://github.com/baotista/tuiner/releases),
+then make it executable and let macOS know it's safe to run — downloaded binaries are quarantined
+by default and refuse to launch until you clear that flag once:
 
 ```sh
 chmod +x tuiner-macos-arm64
-./tuiner-macos-arm64
+xattr -d com.apple.quarantine tuiner-macos-arm64
 ```
 
-(macOS strips the executable bit from downloaded files and may flag it as from an unidentified
-developer the first time you run it — right-click the file and choose "Open" once to approve it,
-or run `xattr -d com.apple.quarantine tuiner-macos-arm64` first.)
+At this point `./tuiner-macos-arm64` runs from wherever you downloaded it. To run it as `tuiner`
+from _any_ directory, put it somewhere on your `PATH` instead. `/usr/local/bin` is on `PATH` by
+default on macOS, so this is usually the simplest option:
+
+```sh
+sudo mv tuiner-macos-arm64 /usr/local/bin/tuiner
+```
+
+If you'd rather not use `sudo`, install it into a directory you own and add that to your `PATH`:
+
+```sh
+mkdir -p ~/.local/bin
+mv tuiner-macos-arm64 ~/.local/bin/tuiner
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # ~/.bash_profile if you use bash
+source ~/.zshrc
+```
+
+Either way, open a new terminal (or `source` the file you just edited) and confirm it worked:
+
+```sh
+tuiner --device 0   # or just `tuiner` to see the input picker
+```
 
 ### Option 2: build from source
 
@@ -50,9 +76,15 @@ Requires a Rust toolchain ([rustup.rs](https://rustup.rs)).
 ```sh
 git clone https://github.com/baotista/tuiner.git
 cd tuiner
-cargo build --release
-./target/release/tuiner
+cargo install --path .
 ```
+
+`cargo install` builds a release binary and copies it to `~/.cargo/bin`, which `rustup` already
+puts on your `PATH` — so `tuiner` is available everywhere as soon as the command finishes, no
+manual `mv` needed. Run `cargo uninstall tuiner` later to remove it.
+
+If you just want the binary without installing it anywhere, `cargo build --release` leaves it at
+`target/release/tuiner` instead.
 
 ## Usage
 
@@ -68,22 +100,22 @@ rather than silently listening to something else.
 
 ### Keybindings
 
-| Key | Action |
-|---|---|
-| `Tab` | toggle between Guided and Chromatic Mode |
-| `t` | cycle through Tunings |
-| `1`–`6` | lock onto a string by number (Guided Mode) |
-| `+` / `-` | adjust Reference Pitch by 1 Hz |
-| `i` | reopen the input picker |
-| `?` | show the keymap |
-| `q` / `Esc` | quit |
+| Key         | Action                                     |
+| ----------- | ------------------------------------------ |
+| `Tab`       | toggle between Guided and Chromatic Mode   |
+| `t`         | cycle through Tunings                      |
+| `1`–`6`     | lock onto a string by number (Guided Mode) |
+| `+` / `-`   | adjust Reference Pitch by 1 Hz             |
+| `i`         | reopen the input picker                    |
+| `?`         | show the keymap                            |
+| `q` / `Esc` | quit                                       |
 
 ### Command-line flags
 
 Skip the picker entirely by specifying an input device and channel up front:
 
 ```sh
-./tuiner --device 0 --channel 1
+tuiner --device 0 --channel 1
 ```
 
 Device and channel indices match the order the picker would list them in. `--channel` requires
