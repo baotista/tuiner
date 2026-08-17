@@ -1,6 +1,6 @@
 # Tuiner
 
-A terminal instrument tuner for guitar and bass. It listens to a chosen audio input, works out
+A terminal instrument tuner for guitar, bass, and ukulele. It listens to a chosen audio input, works out
 what pitch is sounding, and shows the player which way to turn the peg.
 
 ## Language
@@ -40,10 +40,17 @@ draws no distinction between open, modal, and standard tunings.
 _Avoid_: preset, temperament, key, alternate tuning
 
 **String**:
-One of the instrument's playable strings, identified by its position — numbered from 1 at the
-highest-pitched string upwards, following guitarists' convention. Under a given Tuning each String has
-exactly one Target Pitch. Named `InstrumentString` in code, to avoid colliding with Rust's `String`.
+One of the instrument's playable strings, identified by its position — numbered from 1 following the
+instrument's own convention, which usually but not always means the highest-pitched string is 1 and
+pitch descends as the number rises. Under a given Tuning each String has exactly one Target Pitch.
+Named `InstrumentString` in code, to avoid colliding with Rust's `String`.
 _Avoid_: course, channel
+
+**Reentrant Tuning**:
+A Tuning whose Strings are not in descending pitch order by number — the ukulele's `gCEA`, where
+String 4 is `G4` and sounds above Strings 3 and 2. Not a separate concept in code: String numbering
+and pitch order are simply independent, and nothing derives one from the other.
+_Avoid_: high-G, non-linear tuning, out-of-order
 
 **Peg**:
 The tuning machine that tensions one String. One Peg per String, but unlike a String a Peg has a
