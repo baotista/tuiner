@@ -1,6 +1,6 @@
 # Tuiner
 
-A terminal instrument tuner for guitar and bass.
+A terminal instrument tuner for guitar, bass, and ukulele.
 If, like me, you are a musician and a nerd, you might find handy to have a simple tuner inside your terminal. Free forever, without ads, just the useful stuff.
 
 ![input selection](images/SCR-20260817-lepa.png)
@@ -12,9 +12,9 @@ that a chord rings true afterwards.
 
 ## Features
 
-- **Guided Mode**: pick a Tuning (Standard, D Standard, Open C, DADGAD, or four-string Bass
-  Standard) and play your strings in any order — Tuiner works out which string you're on and
-  reports how far it is from in tune.
+- **Guided Mode**: pick a Tuning (Standard, D Standard, Open C, DADGAD, four-string Bass Standard,
+  or Ukulele gCEA) and play your strings in any order — Tuiner works out which string you're on and
+  reports how far it is from in tune. Reentrant tunings are handled.
 - **Chromatic Mode**: no tuning needed — reports the nearest note and its deviation, for anything
   the presets don't cover.
 - **Strobe display**: precision that doesn't run out. A needle or a coarse bar can't show the last

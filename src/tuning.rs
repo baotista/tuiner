@@ -30,8 +30,10 @@ pub const NEIGHBOUR_MARGIN_CENTS: f32 = 15.0;
 /// neighbour on one side — without it, the lowest String would claim any rumble beneath it.
 pub const ABSOLUTE_CAP_CENTS: f32 = 250.0;
 
-/// One of the instrument's playable strings, identified by its position — numbered from 1 at the
-/// highest-pitched String upward, per CONTEXT.md.
+/// One of the instrument's playable strings, identified by its position — numbered from 1 by the
+/// instrument's own convention, per CONTEXT.md. That usually means the highest-pitched String is 1
+/// and pitch descends from there, but not always: in a reentrant Tuning like the ukulele's gCEA,
+/// String 4 sits above Strings 3 and 2.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstrumentString {
     pub number: u8,
@@ -180,7 +182,7 @@ fn build(name: &'static str, strings: &[StringDef], reference_pitch: f32) -> Tun
     Tuning { name, strings }
 }
 
-/// The five Tunings the app ships, in the order `t` cycles through them, with every Target Pitch
+/// The Tunings the app ships, in the order `t` cycles through them, with every Target Pitch
 /// derived from `reference_pitch` — changing it moves every Tuning's Target Pitches together.
 pub fn all(reference_pitch: f32) -> Vec<Tuning> {
     vec![
@@ -209,6 +211,13 @@ pub fn all(reference_pitch: f32) -> Vec<Tuning> {
             &[(1, 43), (2, 38), (3, 33), (4, 28)],
             reference_pitch,
         ),
+        // Reentrant: String 4 is G4, above Strings 3 and 2 — the tuning the lowercase `g` in
+        // "gCEA" denotes, and the one nearly every ukulele ships with.
+        build(
+            "Ukulele (gCEA)",
+            &[(1, 69), (2, 64), (3, 60), (4, 67)],
+            reference_pitch,
+        ),
     ]
 }
 
@@ -224,9 +233,9 @@ mod tests {
     }
 
     #[test]
-    fn all_five_tunings_are_present_with_correct_target_pitches() {
+    fn every_shipped_tuning_is_present_with_correct_target_pitches() {
         let tunings = all(pitch::DEFAULT_REFERENCE_PITCH);
-        assert_eq!(tunings.len(), 5);
+        assert_eq!(tunings.len(), 6);
 
         let by_name = |name: &str| tunings.iter().find(|t| t.name == name).unwrap();
         let notes = |t: &Tuning| -> Vec<String> {
@@ -254,6 +263,10 @@ mod tests {
         assert_eq!(
             notes(by_name("Bass Standard")),
             vec!["G2", "D2", "A1", "E1"]
+        );
+        assert_eq!(
+            notes(by_name("Ukulele (gCEA)")),
+            vec!["A4", "E4", "C4", "G4"]
         );
     }
 
@@ -369,6 +382,44 @@ mod tests {
             }
             Match::Note { note, .. } => panic!("expected String 6 (E2), got Note {note}"),
         }
+    }
+
+    #[test]
+    fn a_reentrant_ukulele_g_is_identified_as_string_4_despite_outranking_strings_3_and_2() {
+        // The gCEA ukulele is the only shipped Tuning where String numbering and pitch order
+        // disagree: G4 is String 4 but sits above C4 (String 3) and E4 (String 2). Every other
+        // Tuning descends in pitch as the number rises, so a refactor that "tidied up" the sort
+        // in `build` by dropping the re-sort back to String number would still pass those — and
+        // silently mislabel every ukulele String. This is the test that would catch it.
+        let uke = tuning("Ukulele (gCEA)");
+
+        let expected = [(1u8, 69, "A4"), (2, 64, "E4"), (3, 60, "C4"), (4, 67, "G4")];
+        for (want_number, midi, want_note) in expected {
+            let hz = pitch::midi_to_hz(midi, pitch::DEFAULT_REFERENCE_PITCH);
+            match uke.match_pitch(hz, pitch::DEFAULT_REFERENCE_PITCH) {
+                Match::String {
+                    number,
+                    note,
+                    cents,
+                } => {
+                    assert_eq!(number, want_number, "{want_note} matched String {number}");
+                    assert_eq!(note, want_note);
+                    assert!(
+                        cents.abs() < 0.01,
+                        "{want_note} was {cents:+.3}c off target"
+                    );
+                }
+                Match::Note { note, .. } => {
+                    panic!("expected String {want_number} ({want_note}), got Note {note}")
+                }
+            }
+        }
+
+        // And the reentrancy is real, not an accident of the note names: String 4 outranks both.
+        let string = |n: u8| uke.strings.iter().find(|s| s.number == n).unwrap();
+        assert!(string(4).target_hz > string(3).target_hz);
+        assert!(string(4).target_hz > string(2).target_hz);
+        assert!(string(4).target_hz < string(1).target_hz);
     }
 
     #[test]
